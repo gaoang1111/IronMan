@@ -166,6 +166,7 @@ class IronCellModel(PreTrainedModel):
         *,
         inputs_embeds: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
         labels: torch.LongTensor | None = None,
         **kwargs: Any,
     ):
@@ -178,6 +179,7 @@ class IronCellModel(PreTrainedModel):
                 - [B,S,S] boolean (True=allowed)
                 - [B,1,S,S] additive float mask (0 / -inf)
                 - [B,S] padding mask (fallback to model's causal mask)
+            position_ids: manual RoPE position ids (recommended for zipper geometry).
             labels: language modeling labels; typically prefix positions are -100.
         """
         if attention_mask is not None and attention_mask.dim() == 3 and attention_mask.dtype == torch.bool:
@@ -186,6 +188,7 @@ class IronCellModel(PreTrainedModel):
         return self.generator(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
+            position_ids=position_ids,
             labels=labels,
             **kwargs,
         )

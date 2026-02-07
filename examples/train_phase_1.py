@@ -10,13 +10,12 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_DIR = PROJECT_ROOT / "src"
-os.sys.path.insert(0, str(SRC_DIR))
+os.sys.path.insert(0, str(PROJECT_ROOT))
 
-from configuration_iron_cell import IronCellConfig
-from data_processor import IronCellCollator
-from modeling_iron_cell import IronCellModel
-from token_utils import add_iron_cell_special_tokens, resize_and_smart_init_special_tokens
+from src.configuration_iron_cell import IronCellConfig
+from src.data_processor import IronCellCollator
+from src.modeling_iron_cell import IronCellModel
+from src.token_utils import add_iron_cell_special_tokens, resize_and_smart_init_special_tokens
 
 
 @dataclass(frozen=True)
@@ -75,6 +74,7 @@ def main() -> None:
         chunk_ids = batch.chunk_input_ids.to(device)
         chunk_mask = batch.chunk_attention_mask.to(device)
         zipper_ids = batch.zipper_input_ids.to(device)
+        zipper_pos_ids = batch.zipper_position_ids.to(device)
         mem_pos = batch.memory_positions.to(device)
         labels = batch.labels.to(device)
         attn_2d = batch.attention_mask_2d.to(device)
@@ -92,6 +92,7 @@ def main() -> None:
             out = model(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attn_2d,
+                position_ids=zipper_pos_ids,
                 labels=labels,
             )
             loss = out.loss
