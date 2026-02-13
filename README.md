@@ -179,3 +179,16 @@ Mark 1 is a prototype. Mark 42 is the invitation:
 - More standardized reproducibility and benchmarks
 
 And there will be more...
+
+Citation
+If you find IronCell Mark 1 helpful in your research or applications, please cite it using the following format:
+
+@misc{ironcell2026,
+  title={IronCell Mark 1: 16:1 Full Sequence Compression via Homologous Model Differentiation},
+  author={gaoang1111},
+  year={2026},
+  publisher={GitHub},
+  journal={GitHub Repository},
+  howpublished={\url{https://github.com/gaoang1111/IronMan}}
+}
+
