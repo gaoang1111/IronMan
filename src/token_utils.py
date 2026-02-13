@@ -13,6 +13,7 @@ class IronCellSpecialTokens:
 
     soc_token: str = "<soc>"
     eoc_token: str = "<eoc>"
+    v_none_token: str = "<v_none>"
 
 
 def add_iron_cell_special_tokens(
@@ -26,13 +27,14 @@ def add_iron_cell_special_tokens(
         A dict mapping token name to token id.
     """
     added = tokenizer.add_special_tokens(
-        {"additional_special_tokens": [tokens.soc_token, tokens.eoc_token]}
+        {"additional_special_tokens": [tokens.soc_token, tokens.eoc_token, tokens.v_none_token]}
     )
     _ = added
 
     soc_id = tokenizer.convert_tokens_to_ids(tokens.soc_token)
     eoc_id = tokenizer.convert_tokens_to_ids(tokens.eoc_token)
-    return {"soc_id": int(soc_id), "eoc_id": int(eoc_id)}
+    v_none_id = tokenizer.convert_tokens_to_ids(tokens.v_none_token)
+    return {"soc_id": int(soc_id), "eoc_id": int(eoc_id), "v_none_id": int(v_none_id)}
 
 
 def _mean_embedding_of_text(
@@ -53,6 +55,7 @@ def resize_and_smart_init_special_tokens(
     tokens: IronCellSpecialTokens = IronCellSpecialTokens(),
     soc_init_candidates: Iterable[str] = ("Summary", "Note"),
     eoc_init_text: str = "\n",
+    v_none_init_text: str = "none",
     std_noise: float = 1e-3,
 ) -> None:
     """
@@ -72,6 +75,7 @@ def resize_and_smart_init_special_tokens(
 
     soc_id = int(tokenizer.convert_tokens_to_ids(tokens.soc_token))
     eoc_id = int(tokenizer.convert_tokens_to_ids(tokens.eoc_token))
+    v_none_id = int(tokenizer.convert_tokens_to_ids(tokens.v_none_token))
 
     embed = model.get_input_embeddings()
     weight = embed.weight.data
@@ -86,10 +90,12 @@ def resize_and_smart_init_special_tokens(
         soc_vec = weight.mean(dim=0)
 
     eoc_vec = _mean_embedding_of_text(tokenizer, weight, eoc_init_text)
+    v_none_vec = _mean_embedding_of_text(tokenizer, weight, v_none_init_text)
 
     noise_soc = torch.randn_like(soc_vec) * std_noise
     noise_eoc = torch.randn_like(eoc_vec) * std_noise
+    noise_v_none = torch.randn_like(v_none_vec) * std_noise
 
     weight[soc_id].copy_(soc_vec + noise_soc)
     weight[eoc_id].copy_(eoc_vec + noise_eoc)
-
+    weight[v_none_id].copy_(v_none_vec + noise_v_none)

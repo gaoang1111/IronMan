@@ -26,6 +26,7 @@ class IronCellConfig(PretrainedConfig):
         projector_init_type: Literal["identity", "gaussian"] = "identity",
         freeze_compressor: bool = True,
         trainable_components: list[str] | None = None,
+        special_token_ids: list[int] | None = None,
         **kwargs,
     ) -> None:
         """
@@ -50,5 +51,5 @@ class IronCellConfig(PretrainedConfig):
             "embed_tokens",
             "special_tokens",
         ]
+        self.special_token_ids = special_token_ids
         super().__init__(**kwargs)
-

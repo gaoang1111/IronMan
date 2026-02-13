@@ -46,175 +46,273 @@ def _chunk_list(token_ids: list[int], chunk_size: int) -> list[list[int]]:
     return [token_ids[i : i + chunk_size] for i in range(0, len(token_ids), chunk_size)]
 
 
-def _build_prefix_ids(
-    soc_id: int,
-    eoc_id: int,
-    num_chunks: int,
-    placeholder_id: int,
-) -> tuple[list[int], list[int]]:
-    prefix_ids: list[int] = [soc_id]
-    memory_positions: list[int] = []
-    for _ in range(num_chunks):
-        memory_positions.append(len(prefix_ids))
-        prefix_ids.append(placeholder_id)
-        prefix_ids.append(eoc_id)
-    return prefix_ids, memory_positions
-
-
-def build_zipper_geometry(
+def build_zipper_mask_posid(
     *,
     seq_len: int,
     valid_len: int,
     num_chunks: int,
     chunk_size: int,
+    left_over: int = 0,
     device: torch.device,
+    buffer_size: int = 0,
 ) -> tuple[torch.BoolTensor, torch.LongTensor]:
-    """
-    Build Iron-Cell zipper geometry (Sieve Mask + Manual RoPE position ids) for one sample.
+    
+    # ==========================================
+    # 1. 统一逻辑：Raw 段数 = Control 组数
+    # ==========================================
+    # 如果有 leftover，它就是第 N+1 个段
+    num_raw_segments = num_chunks + (1 if left_over > 0 else 0)
+    num_control_groups = num_raw_segments
+    
+    # 计算 Prefix 长度
+    # Prefix: BOS + SOC + (v + EOC) * num_control_groups
+    # 这里的 num_control_groups 包含了初始组 (-1 组) 到 倒数第二组
+    # 刚好对应每一个 Raw Segment
+    prefix_len = 1 + 1 + 2 * num_control_groups
+    
+    raw_phys_start = prefix_len
+    
+    # 校验长度 (非常重要，防止 Input 拼错了但 Mask 没报错)
+    expected_valid_len = prefix_len + num_chunks * chunk_size + left_over
+    assert valid_len == expected_valid_len, \
+        f"Geometry mismatch! Valid:{valid_len} vs Calc:{expected_valid_len}. Check Input Assembly."
 
-    Physical layout:
-        [SOC] [V1] [EOC1] [V2] [EOC2] ... [VN] [EOCN] || [Raw_Chunk_1] ... [Raw_Chunk_N]
+    mask = torch.zeros((seq_len, seq_len), dtype=torch.bool, device=device)
+    
+    # ==========================================
+    # 2. Prefix 内部逻辑 (Control Chain)
+    # ==========================================
+    
+    # 2.1 BOS & SOC
+    mask[0, 0] = True      # BOS 看 BOS
+    mask[1, :2] = True     # SOC 看 BOS, SOC
+    
+    # 2.2 v 和 EOC (因果链)
+    for k in range(num_control_groups):
+        # 物理位置计算
+        v_idx = 2 + 2 * k       # BOS(0), SOC(1), v0(2), E0(3), v1(4)...
+        eoc_idx = 3 + 2 * k
+        
+        # 历史可见性: 能看 BOS, SOC 以及所有之前的 v
+        # 之前的 v 的索引: 2, 4, ..., 2*k
+        # 这里的 arange(k+1) 生成 0..k，再变换
+        prev_v_indices = 2 + 2 * torch.arange(k + 1, device=device)
+        
+        # --- v (Compressor) ---
+        mask[v_idx, :2] = True            # BOS, SOC
+        mask[v_idx, prev_v_indices] = True # 之前的 v (含自己)
+        
+        # --- EOC (Trigger) ---
+        mask[eoc_idx, :2] = True          # BOS, SOC
+        mask[eoc_idx, prev_v_indices] = True # 之前的 v
+        mask[eoc_idx, eoc_idx] = True     # EOC 看自己
+    
+    # ==========================================
+    # 3. Raw Chunk 逻辑 (Hybrid Attention)
+    # ==========================================
+    
+    for i in range(num_raw_segments):
+        # 计算当前 Raw Chunk 的物理范围
+        c_start = raw_phys_start + i * chunk_size
+        c_end = min(c_start + chunk_size, valid_len)
+        
+        # 实际长度 (最后一段可能是 leftover)
+        c_len = c_end - c_start
+        if c_len <= 0: continue # 防御性代码
 
-    Sieve mask rules (code.md spec):
-        - Prefix region (SOC/V/EOC): standard causal mask.
-        - Raw_Chunk_k:
-            * must see: SOC, V1..Vk, and ONLY its own EOC_k
-            * must NOT see: any other EOC (past or future), any future V, any other raw chunk
-            * must see: its own chunk internal causal history
+        # A. Chunk 内部自回归 (Autoregressive)
+        chunk_causal = torch.tril(torch.ones((c_len, c_len), dtype=torch.bool, device=device))
+        mask[c_start:c_end, c_start:c_end] = chunk_causal
+        
+        # B. 历史判定 (Split Logic)
+        # split_idx 表示从哪里开始是 Buffer (保留高清原图)
+        # 比 split_idx 小的都是 Compressed (只看 v)
+        split_idx = i - buffer_size
+        
+        # --- 压缩部分 (Compressed History) ---
+        if split_idx >= 0:
+            # 1. BOS, SOC
+            mask[c_start:c_end, :2] = True
+            
+            # 2. v 序列 (直到 split_idx)
+            # 注意：如果 Raw_i 是 Compressed，那么 Raw_i 对应的 v_i 就是 summary。
+            # 当前 chunk 应该看之前的 chunks 对应的 v。
+            # 第 k 个 chunk 对应的 v 是 Group k-1 (如果 Group -1 算 0 号的话...)
+            # 让我们理一下索引：
+            # Raw 0 看 v_-1 (Group 0)
+            # Raw 1 看 v_-1, v_0 (Group 0, 1)
+            # 所以 Raw i 应该看 Group 0 到 Group i (inclusive, 因为 v_i 还没生成呢? 不，v_i 是 Raw i 的总结)
+            # 正确逻辑: Raw i 只能看 Raw 0..i-1 的总结。
+            # Raw 0 对应的总结是 v_0 (在 Group 1, Idx 4)。
+            # 初始状态是 v_-1 (在 Group 0, Idx 2)。
+            
+            # 这里的 split_idx 是 chunk index。
+            # 我们需要看到 Group 0 到 Group split_idx 的 v。
+            limit_idx = split_idx 
+            v_indices = 2 + 2 * torch.arange(limit_idx + 1, device=device)
+            mask[c_start:c_end, v_indices.unsqueeze(0)] = True
+            
+            # 3. Trigger EOC (仅最后一个被压缩块的 EOC，作为桥梁)
+            # 也就是 Group split_idx 的 EOC
+            last_eoc_idx = 3 + 2 * limit_idx
+            mask[c_start:c_end, last_eoc_idx] = True
+            
+        # --- 缓冲部分 (Buffered History) ---
+        start_buffer_idx = max(0, split_idx)
+        for j in range(start_buffer_idx, i):
+            prev_c_start = raw_phys_start + j * chunk_size
+            prev_c_end = min(prev_c_start + chunk_size, valid_len)
+            
+            if prev_c_end > prev_c_start:
+                mask[c_start:c_end, prev_c_start:prev_c_end] = True
 
-    Manual RoPE position_ids:
-        pos(SOC)=0
-        pos(V_k)=2k-1, pos(EOC_k)=2k
-        pos(Raw_k_start)=pos(EOC_k)+1=2k+1, then increments within chunk.
-    """
-    if valid_len > seq_len:
-        raise ValueError(f"valid_len ({valid_len}) cannot exceed seq_len ({seq_len})")
-    if num_chunks < 1:
-        raise ValueError(f"num_chunks must be >= 1, got {num_chunks}")
-    if chunk_size <= 0:
-        raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
+    # ==========================
+    # 4. RoPE IDs
+    # ==========================
+    pos_ids = mask.long().sum(dim=-1) - 1
+    pos_ids = pos_ids.clamp(min=0)
 
-    prefix_len = 1 + 2 * num_chunks
-    if prefix_len > valid_len:
-        raise ValueError(f"prefix_len ({prefix_len}) cannot exceed valid_len ({valid_len})")
-
-    q = torch.arange(seq_len, device=device).view(-1, 1)
-    k = torch.arange(seq_len, device=device).view(1, -1)
-
-    valid_q = q < valid_len
-    valid_k = k < valid_len
-    valid = valid_q & valid_k
-
-    is_prefix_q = q < prefix_len
-    is_raw_q = (~is_prefix_q) & valid_q
-
-    causal = k <= q
-    prefix_allowed = valid & is_prefix_q & causal
-
-    raw_qpos = (q - prefix_len).clamp(min=0)
-    q_chunk = (raw_qpos // chunk_size) + 1
-    q_chunk = torch.where(is_raw_q, q_chunk, torch.zeros_like(q_chunk))
-
-    is_prefix_k = (k < prefix_len) & valid_k
-    is_raw_k = (k >= prefix_len) & valid_k
-
-    raw_kpos = (k - prefix_len).clamp(min=0)
-    k_chunk = (raw_kpos // chunk_size) + 1
-    k_chunk = torch.where(is_raw_k, k_chunk, torch.zeros_like(k_chunk))
-
-    same_raw_chunk = is_raw_k & (k_chunk == q_chunk)
-    raw_internal_causal = same_raw_chunk & causal
-
-    soc_key = k == 0
-    is_v_key = is_prefix_k & (k % 2 == 1)
-    v_index = (k + 1) // 2
-    v_allowed = is_v_key & (v_index <= q_chunk)
-
-    is_eoc_key = is_prefix_k & (k % 2 == 0) & (k > 0)
-    eoc_index = k // 2
-    eoc_allowed = is_eoc_key & (eoc_index == q_chunk)
-
-    prefix_allowed_for_raw = is_prefix_k & (soc_key | v_allowed | eoc_allowed)
-    raw_allowed = valid & is_raw_q & (raw_internal_causal | prefix_allowed_for_raw)
-
-    attention_mask_2d = prefix_allowed | raw_allowed
-
-    position_ids = torch.zeros((seq_len,), dtype=torch.long, device=device)
-    valid_pos = torch.arange(seq_len, device=device) < valid_len
-    pos = torch.arange(seq_len, device=device, dtype=torch.long)
-
-    prefix_pos = pos < prefix_len
-    position_ids = torch.where(valid_pos & prefix_pos, pos, position_ids)
-
-    raw_pos = valid_pos & (~prefix_pos)
-    raw_offset = (pos - prefix_len).clamp(min=0)
-    raw_chunk_idx = (raw_offset // chunk_size) + 1
-    raw_within = raw_offset - (raw_chunk_idx - 1) * chunk_size
-    raw_base = 2 * raw_chunk_idx + 1
-    raw_position_ids = raw_base + raw_within
-    position_ids = torch.where(raw_pos, raw_position_ids, position_ids)
-
-    return attention_mask_2d, position_ids
+    return mask, pos_ids
 
 
-def build_staircase_mask(
-    *,
-    seq_len: int,
+def build_zipper_labels(
+    input_ids: torch.Tensor,
     valid_len: int,
-    prefix_len: int,
     num_chunks: int,
     chunk_size: int,
-    device: torch.device,
-) -> torch.BoolTensor:
-    """
-    Build the 2D staircase attention mask for a single sample.
+    left_over: int,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    num_raw_segments = num_chunks + (1 if left_over > 0 else 0)
+    num_control_groups = num_raw_segments
 
-    Mask rule (MVP):
-        - For all positions: causal within the whole sequence (k <= q).
-        - For raw tokens: additionally block attending to future compression anchors:
-          raw tokens in chunk N can only attend to {SOC, V1..VN, EOC1..EOCN}.
+    prefix_len = 2 + 2 * num_control_groups
+    raw_content_len = (num_chunks * chunk_size) + left_over
+    expected_valid_len = prefix_len + raw_content_len
 
-    Args:
-        seq_len: padded sequence length (S).
-        valid_len: unpadded sequence length.
-        prefix_len: SOC + (V,EOC)*C.
-        num_chunks: number of chunks (C).
-        chunk_size: tokens per chunk for the raw text split.
-        device: torch device.
-    """
-    if valid_len > seq_len:
-        raise ValueError(f"valid_len ({valid_len}) cannot exceed seq_len ({seq_len})")
-    if prefix_len > valid_len:
-        raise ValueError(f"prefix_len ({prefix_len}) cannot exceed valid_len ({valid_len})")
-    if num_chunks < 1:
-        raise ValueError(f"num_chunks must be >= 1, got {num_chunks}")
-
-    q = torch.arange(seq_len, device=device).view(-1, 1)
-    k = torch.arange(seq_len, device=device).view(1, -1)
-
-    valid_q = q < valid_len
-    valid_k = k < valid_len
-    causal = (k <= q) & valid_q & valid_k
-
-    query_is_raw = (q >= prefix_len) & valid_q
-    key_is_prefix = (k < prefix_len) & valid_k
-
-    raw_pos = (q - prefix_len).clamp(min=0)
-    query_chunk_index = (raw_pos // chunk_size) + 1
-    query_chunk_index = torch.where(query_is_raw, query_chunk_index, torch.zeros_like(query_chunk_index))
-
-    key_pos = k
-    key_mem_index = torch.where(
-        key_pos == 0,
-        torch.zeros_like(key_pos),
-        (key_pos + 1) // 2,
+    assert valid_len == expected_valid_len, (
+        f"Geometry Error! Valid:{valid_len} vs Calc:{expected_valid_len}. "
+        f"(Chunks:{num_chunks}, Size:{chunk_size}, Left:{left_over} -> "
+        f"Segments:{num_raw_segments}, Prefix:{prefix_len})"
     )
-    key_mem_index = torch.where(key_is_prefix, key_mem_index, torch.zeros_like(key_mem_index))
 
-    block_future_mem = query_is_raw & key_is_prefix & (key_mem_index > query_chunk_index)
-    allowed = causal & (~block_future_mem)
-    return allowed
+    raw_phys_start = prefix_len
+    labels = torch.full_like(input_ids, ignore_index)
 
+    for k in range(num_raw_segments):
+        curr_start = raw_phys_start + k * chunk_size
+        curr_end = min(curr_start + chunk_size, valid_len)
+        chunk_len = curr_end - curr_start
+
+        if chunk_len > 1:
+            labels[..., curr_start + 1 : curr_end] = input_ids[..., curr_start + 1 : curr_end]
+
+    for k in range(num_control_groups):
+        eoc_idx = 3 + 2 * k
+        curr_raw_start = raw_phys_start + k * chunk_size
+
+        if curr_raw_start < valid_len:
+            if eoc_idx + 1 < labels.size(-1):
+                labels[..., eoc_idx + 1] = input_ids[..., curr_raw_start]
+
+    return labels
+
+
+build_zipper_attn_mask_and_pos_ids = build_zipper_mask_posid
+
+
+class ZipperBuilder:
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        prompt: str,
+        *,
+        chunk_size: int,
+        buffer_size: int = 0,
+    ) -> None:
+        self.tokenizer = tokenizer
+        self.prompt = prompt
+        self.chunk_size = int(chunk_size)
+        self.buffer_size = int(buffer_size)
+
+        if self.chunk_size <= 0:
+            raise ValueError(f"chunk_size must be > 0, got {self.chunk_size}")
+
+        bos_id = tokenizer.bos_token_id
+        eos_id = tokenizer.eos_token_id
+        if bos_id is None or eos_id is None:
+            raise ValueError("Tokenizer must define both bos_token_id and eos_token_id.")
+        self.bos_id = int(bos_id)
+        self.eos_id = int(eos_id)
+
+        self.soc_id = int(tokenizer.convert_tokens_to_ids("<soc>"))
+        self.eoc_id = int(tokenizer.convert_tokens_to_ids("<eoc>"))
+        self.v_none_id = int(tokenizer.convert_tokens_to_ids("<v_none>"))
+        if self.soc_id < 0 or self.eoc_id < 0 or self.v_none_id < 0:
+            raise ValueError("Special tokens not found in tokenizer; call add_iron_cell_special_tokens first.")
+
+        self.raw_core_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        self.raw_len = len(self.raw_core_ids)
+
+        self.num_chunks = self.raw_len // self.chunk_size
+        self.left_over = self.raw_len % self.chunk_size
+
+        if self.left_over == 0:
+            self.num_cmp_chunks = self.num_chunks - 1
+        else:
+            self.num_cmp_chunks = self.num_chunks
+
+        if self.num_cmp_chunks < 1:
+            raise ValueError(
+                "Invalid sample for compression: num_cmp_chunks must be >= 1. "
+                f"raw_len={self.raw_len}, chunk_size={self.chunk_size}, "
+                f"num_chunks={self.num_chunks}, left_over={self.left_over}"
+            )
+
+        self.cmp_chunk_len = self.chunk_size + 2
+        full_part_len = self.num_chunks * self.chunk_size
+        full_part = self.raw_core_ids[:full_part_len]
+        raw_chunks = _chunk_list(full_part, self.chunk_size)
+        raw_chunks = raw_chunks[: self.num_cmp_chunks]
+        self.cmp_wrapped_chunks = [[self.bos_id, *c, self.eos_id] for c in raw_chunks]
+
+        num_control_groups = self.num_chunks + (1 if self.left_over > 0 else 0)
+        prefix_ids: list[int] = [self.bos_id, self.soc_id]
+        for _ in range(num_control_groups):
+            prefix_ids.append(self.v_none_id)
+            prefix_ids.append(self.eoc_id)
+        self.prefix_ids = prefix_ids
+        self.prefix_len = len(prefix_ids)
+
+        self.gen_input_ids = self.prefix_ids + self.raw_core_ids
+        self.valid_len = len(self.gen_input_ids)
+        
+        # WARNING: This assumes prefix is exactly [BOS, SOC] (len 2). 
+        # k starts from 1 to skip v_-1 (at index 2), aligning with CMP outputs (v_0, v_1...).
+        self.memory_positions = [2 + 2 * k for k in range(1, self.num_cmp_chunks + 1)]
+
+    def build_gen_labels(self, device: torch.device) -> torch.LongTensor:
+        input_ids_t = torch.tensor(self.gen_input_ids, dtype=torch.long, device=device)
+        return build_zipper_labels(
+            input_ids=input_ids_t,
+            valid_len=self.valid_len,
+            num_chunks=self.num_chunks,
+            chunk_size=self.chunk_size,
+            left_over=self.left_over,
+        )
+
+    def build_gen_attention_and_pos(
+        self, *, seq_len: int, device: torch.device
+    ) -> tuple[torch.BoolTensor, torch.LongTensor]:
+        return build_zipper_mask_posid(
+            seq_len=seq_len,
+            valid_len=self.valid_len,
+            num_chunks=self.num_chunks,
+            chunk_size=self.chunk_size,
+            left_over=self.left_over,
+            device=device,
+            buffer_size=self.buffer_size,
+        )
 
 class IronCellCollator:
     """
@@ -229,62 +327,30 @@ class IronCellCollator:
         self,
         tokenizer: PreTrainedTokenizerBase,
         *,
-        chunk_size: int = 256,
+        chunk_size: int = 16,
         pad_to_multiple_of: int | None = 8,
-        soc_token: str = "<soc>",
-        eoc_token: str = "<eoc>",
+        buffer_size: int = 0,
     ) -> None:
         self.tokenizer = tokenizer
         self.chunk_size = int(chunk_size)
         self.pad_to_multiple_of = pad_to_multiple_of
-        self.soc_id = int(tokenizer.convert_tokens_to_ids(soc_token))
-        self.eoc_id = int(tokenizer.convert_tokens_to_ids(eoc_token))
-        if self.soc_id < 0 or self.eoc_id < 0:
-            raise ValueError("Special tokens not found in tokenizer; call add_iron_cell_special_tokens first.")
+        self.buffer_size = int(buffer_size)
 
     def __call__(self, texts: Sequence[str]) -> ZipperBatch:
         if len(texts) == 0:
             raise ValueError("Empty batch")
 
         device = torch.device("cpu")
-        pad_id = int(self.tokenizer.pad_token_id) if self.tokenizer.pad_token_id is not None else 0
+        pad_id = int(self.tokenizer.pad_token_id) if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
 
-        per_sample = []
-        max_zip_len = 0
-        max_num_chunks = 0
-        max_chunk_len = 0
+        builders: list[ZipperBuilder] = [
+            ZipperBuilder(self.tokenizer, text, chunk_size=self.chunk_size, buffer_size=self.buffer_size)
+            for text in texts
+        ]
 
-        for text in texts:
-            raw_ids = self.tokenizer.encode(text, add_special_tokens=False)
-            if len(raw_ids) == 0:
-                raw_ids = [pad_id]
-
-            chunks = _chunk_list(raw_ids, self.chunk_size)
-            num_chunks = len(chunks)
-
-            prefix_ids, mem_pos = _build_prefix_ids(
-                soc_id=self.soc_id,
-                eoc_id=self.eoc_id,
-                num_chunks=num_chunks,
-                placeholder_id=self.soc_id,
-            )
-            zipper_ids = prefix_ids + raw_ids
-            prefix_len = len(prefix_ids)
-            valid_len = len(zipper_ids)
-
-            max_zip_len = max(max_zip_len, valid_len)
-            max_num_chunks = max(max_num_chunks, num_chunks)
-            max_chunk_len = max(max_chunk_len, max(len(c) for c in chunks))
-
-            per_sample.append(
-                {
-                    "zipper_ids": zipper_ids,
-                    "prefix_len": prefix_len,
-                    "valid_len": valid_len,
-                    "mem_pos": mem_pos,
-                    "chunks": chunks,
-                }
-            )
+        max_zip_len = max(b.valid_len for b in builders)
+        max_num_cmp_chunks = max(b.num_cmp_chunks for b in builders)
+        cmp_chunk_len = self.chunk_size + 2
 
         if self.pad_to_multiple_of is not None and max_zip_len % self.pad_to_multiple_of != 0:
             m = self.pad_to_multiple_of
@@ -298,53 +364,45 @@ class IronCellCollator:
         valid_lens = torch.zeros((len(texts),), dtype=torch.long, device=device)
 
         chunk_input_ids = torch.full(
-            (len(texts), max_num_chunks, max_chunk_len),
+            (len(texts), max_num_cmp_chunks, cmp_chunk_len),
             pad_id,
             dtype=torch.long,
             device=device,
         )
         chunk_attention_mask = torch.zeros(
-            (len(texts), max_num_chunks, max_chunk_len),
+            (len(texts), max_num_cmp_chunks, cmp_chunk_len),
             dtype=torch.long,
             device=device,
         )
         memory_positions = torch.full(
-            (len(texts), max_num_chunks),
+            (len(texts), max_num_cmp_chunks),
             -1,
             dtype=torch.long,
             device=device,
         )
 
-        for b, item in enumerate(per_sample):
-            ids = item["zipper_ids"]
-            prefix_len = int(item["prefix_len"])
-            valid_len = int(item["valid_len"])
-            mem_pos = item["mem_pos"]
-            chunks = item["chunks"]
+        for b, builder in enumerate(builders):
+            valid_len = builder.valid_len
+            prefix_len = builder.prefix_len
 
-            zipper_input_ids[b, :valid_len] = torch.tensor(ids, dtype=torch.long)
+            zipper_input_ids[b, :valid_len] = torch.tensor(builder.gen_input_ids, dtype=torch.long, device=device)
 
-            labels[b, :valid_len] = zipper_input_ids[b, :valid_len]
-            labels[b, :prefix_len] = -100
+            labels_b = builder.build_gen_labels(device=device)
+            labels[b, :valid_len] = labels_b
             labels[b, valid_len:] = -100
 
             prefix_lens[b] = prefix_len
             valid_lens[b] = valid_len
 
-            memory_positions[b, : len(mem_pos)] = torch.tensor(mem_pos, dtype=torch.long)
-
-            for i, c in enumerate(chunks):
-                c_len = len(c)
-                chunk_input_ids[b, i, :c_len] = torch.tensor(c, dtype=torch.long)
-                chunk_attention_mask[b, i, :c_len] = 1
-
-            attn, pos_ids = build_zipper_geometry(
-                seq_len=max_zip_len,
-                valid_len=valid_len,
-                num_chunks=len(chunks),
-                chunk_size=self.chunk_size,
-                device=device,
+            memory_positions[b, : builder.num_cmp_chunks] = torch.tensor(
+                builder.memory_positions, dtype=torch.long, device=device
             )
+
+            for i, c in enumerate(builder.cmp_wrapped_chunks):
+                chunk_input_ids[b, i, :] = torch.tensor(c, dtype=torch.long, device=device)
+                chunk_attention_mask[b, i, :] = 1
+
+            attn, pos_ids = builder.build_gen_attention_and_pos(seq_len=max_zip_len, device=device)
             attention_mask_2d[b] = attn
             position_ids[b] = pos_ids
 
@@ -359,4 +417,3 @@ class IronCellCollator:
             prefix_lens=prefix_lens,
             valid_lens=valid_lens,
         )
-
