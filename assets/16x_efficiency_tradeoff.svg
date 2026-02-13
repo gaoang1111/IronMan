@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="600" viewBox="0 0 1200 600">
+  <rect width="1200" height="600" fill="#ffffff"/>
+
+  <style>
+    .title { font: 700 22px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; fill: #111827; }
+    .subtitle { font: 600 16px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; fill: #111827; }
+    .label { font: 500 14px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; fill: #111827; }
+    .tick { font: 12px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; fill: #6b7280; }
+    .grid { stroke: #e5e7eb; stroke-width: 1; }
+    .axis { stroke: #9ca3af; stroke-width: 1; }
+    .barBase { fill: #97a6a6; }
+    .barIron { fill: #ef4444; }
+    .barIronGreen { fill: #22c55e; }
+    .value { font: 700 14px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; fill: #111827; }
+  </style>
+
+  <text x="600" y="44" text-anchor="middle" class="title">The 16:1 Efficiency Trade-off</text>
+
+  <!-- Left chart: PPL -->
+  <g transform="translate(60,90)">
+    <text x="260" y="0" text-anchor="middle" class="subtitle">Perplexity (PPL) on FineWeb</text>
+
+    <!-- chart area -->
+    <g transform="translate(0,30)">
+      <!-- axes -->
+      <line x1="40" y1="420" x2="520" y2="420" class="axis"/>
+      <line x1="40" y1="0" x2="40" y2="420" class="axis"/>
+
+      <!-- grid + ticks (0..14 step 2) -->
+      <g>
+        <line x1="40" y1="420" x2="520" y2="420" class="grid"/>
+        <line x1="40" y1="360" x2="520" y2="360" class="grid"/>
+        <line x1="40" y1="300" x2="520" y2="300" class="grid"/>
+        <line x1="40" y1="240" x2="520" y2="240" class="grid"/>
+        <line x1="40" y1="180" x2="520" y2="180" class="grid"/>
+        <line x1="40" y1="120" x2="520" y2="120" class="grid"/>
+        <line x1="40" y1="60" x2="520" y2="60" class="grid"/>
+        <line x1="40" y1="0" x2="520" y2="0" class="grid"/>
+
+        <text x="28" y="424" text-anchor="end" class="tick">0</text>
+        <text x="28" y="364" text-anchor="end" class="tick">2</text>
+        <text x="28" y="304" text-anchor="end" class="tick">4</text>
+        <text x="28" y="244" text-anchor="end" class="tick">6</text>
+        <text x="28" y="184" text-anchor="end" class="tick">8</text>
+        <text x="28" y="124" text-anchor="end" class="tick">10</text>
+        <text x="28" y="64" text-anchor="end" class="tick">12</text>
+        <text x="28" y="4" text-anchor="end" class="tick">14</text>
+      </g>
+
+      <!-- bars (scale: 14 -> 420px) -->
+      <!-- Base: 7.40 => 222px -->
+      <rect x="120" y="198" width="140" height="222" class="barBase"/>
+      <text x="190" y="190" text-anchor="middle" class="value">7.40</text>
+      <text x="190" y="452" text-anchor="middle" class="label">Llama 3.1 8B (Base)</text>
+
+      <!-- IronCell: 11.20 => 336px -->
+      <rect x="340" y="84" width="140" height="336" class="barIron"/>
+      <text x="410" y="76" text-anchor="middle" class="value">11.20</text>
+      <text x="410" y="452" text-anchor="middle" class="label">IronCell (16:1)</text>
+    </g>
+  </g>
+
+  <!-- Right chart: KV cache VRAM footprint -->
+  <g transform="translate(640,90)">
+    <text x="260" y="0" text-anchor="middle" class="subtitle">KV Cache VRAM Footprint</text>
+
+    <g transform="translate(0,30)">
+      <line x1="40" y1="420" x2="520" y2="420" class="axis"/>
+      <line x1="40" y1="0" x2="40" y2="420" class="axis"/>
+
+      <!-- grid + ticks (0..100 step 20) -->
+      <g>
+        <line x1="40" y1="420" x2="520" y2="420" class="grid"/>
+        <line x1="40" y1="336" x2="520" y2="336" class="grid"/>
+        <line x1="40" y1="252" x2="520" y2="252" class="grid"/>
+        <line x1="40" y1="168" x2="520" y2="168" class="grid"/>
+        <line x1="40" y1="84" x2="520" y2="84" class="grid"/>
+        <line x1="40" y1="0" x2="520" y2="0" class="grid"/>
+
+        <text x="28" y="424" text-anchor="end" class="tick">0</text>
+        <text x="28" y="340" text-anchor="end" class="tick">20</text>
+        <text x="28" y="256" text-anchor="end" class="tick">40</text>
+        <text x="28" y="172" text-anchor="end" class="tick">60</text>
+        <text x="28" y="88" text-anchor="end" class="tick">80</text>
+        <text x="28" y="4" text-anchor="end" class="tick">100</text>
+      </g>
+
+      <!-- bars (scale: 100 -> 420px) -->
+      <!-- Base: 100% => 420px -->
+      <rect x="120" y="0" width="140" height="420" class="barBase"/>
+      <text x="190" y="-8" text-anchor="middle" class="value">100.00%</text>
+      <text x="190" y="452" text-anchor="middle" class="label">Llama 3.1 8B (Base)</text>
+
+      <!-- IronCell: 6.25% => 26.25px -->
+      <rect x="340" y="393.75" width="140" height="26.25" class="barIronGreen"/>
+      <text x="410" y="385.75" text-anchor="middle" class="value">6.25%</text>
+      <text x="410" y="452" text-anchor="middle" class="label">IronCell (16:1)</text>
+    </g>
+  </g>
+</svg>
