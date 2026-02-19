@@ -11,7 +11,7 @@ class IronCellConfig(PretrainedConfig):
 
     This config intentionally focuses on the MVP core routing:
     - a frozen compressor (AutoModel) to produce semantic hidden states
-    - a trainable projector (Linear) to output compressed vectors V
+    - a trainable Javis (Cross-Attention projector) to output compressed vectors V
     - a generator (AutoModelForCausalLM) to perform autoregressive modeling
       using a zipper-layout embedding sequence and a custom staircase attention mask.
     """
@@ -25,6 +25,13 @@ class IronCellConfig(PretrainedConfig):
         compression_rate: int = 8,
         projector_init_type: Literal["identity", "gaussian"] = "identity",
         freeze_compressor: bool = True,
+        javis_num_heads: int = 16,
+        javis_num_queries: int = 1,
+        javis_ln_in: bool = True,
+        javis_ln_out: bool = True,
+        javis_init_noise_std: float = 0.01,
+        javis_query_warmup_samples: int | None = 100,
+        javis_query_warmup_save_path: str | None = None,
         trainable_components: list[str] | None = None,
         special_token_ids: list[int] | None = None,
         **kwargs,
@@ -39,17 +46,25 @@ class IronCellConfig(PretrainedConfig):
             projector_init_type: "identity" (default) or "gaussian".
             freeze_compressor: Whether compressor forward runs under no_grad
                 and its parameters are frozen.
-            trainable_components: Default ["projector", "embed_tokens", "special_tokens"].
+            trainable_components: Default ["javis", "embed_tokens", "special_tokens"].
         """
         self.compressor_model_name = compressor_model_name
         self.generator_model_name = generator_model_name or compressor_model_name
         self.compression_rate = int(compression_rate)
         self.projector_init_type = projector_init_type
         self.freeze_compressor = bool(freeze_compressor)
-        self.trainable_components = trainable_components or [
-            "projector",
-            "embed_tokens",
-            "special_tokens",
-        ]
+        self.javis_num_heads = int(javis_num_heads)
+        self.javis_num_queries = int(javis_num_queries)
+        self.javis_ln_in = bool(javis_ln_in)
+        self.javis_ln_out = bool(javis_ln_out)
+        self.javis_init_noise_std = float(javis_init_noise_std)
+        self.javis_query_warmup_samples = None if javis_query_warmup_samples is None else int(javis_query_warmup_samples)
+        self.javis_query_warmup_save_path = javis_query_warmup_save_path
+
+        default_trainables = ["javis", "embed_tokens", "special_tokens"]
+        trainable_components = trainable_components or default_trainables
+        if "projector" in trainable_components and "javis" not in trainable_components:
+            trainable_components = [("javis" if x == "projector" else x) for x in trainable_components]
+        self.trainable_components = trainable_components
         self.special_token_ids = special_token_ids
         super().__init__(**kwargs)

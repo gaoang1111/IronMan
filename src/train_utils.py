@@ -34,7 +34,7 @@ class JsonlDataset(Dataset):
         return len(self.texts)
 
     def __getitem__(self, idx):
-        return self.texts[idx]
+        return self.texts[idx], int(idx)
 
 
 def save_checkpoint(model, optimizer, tokenizer, args, step):
@@ -250,12 +250,148 @@ def load_model(args, tokenizer, device: torch.device, *, is_resume: bool) -> Iro
         generator_model_name=args.model_name,
         freeze_compressor=(args.phase == "phase1"),
         projector_init_type="identity",
-        trainable_components=["projector", "embed_tokens", "special_tokens"],
+        trainable_components=["javis", "embed_tokens", "special_tokens"],
+        javis_query_warmup_samples=getattr(args, "javis_query_warmup_samples", None),
+        javis_query_warmup_save_path=getattr(args, "javis_query_warmup_save_path", None),
+        javis_num_queries=getattr(args, "javis_num_queries", 1),
     )
     model = IronCellModel(config).to(device)
     resize_and_smart_init_special_tokens(model.generator, tokenizer)
     resize_and_smart_init_special_tokens(model.compressor, tokenizer)
     return model
+
+
+def warmup_init_javis_query(
+    model: IronCellModel,
+    loader,
+    *,
+    num_samples: int | None,
+    save_path: str | None,
+    use_dist: bool,
+) -> None:
+    if num_samples is None or int(num_samples) <= 0:
+        return
+
+    save_path = None if save_path is None or str(save_path).strip() == "" else str(save_path)
+
+    device = model.device
+    model_was_training = model.training
+    model.eval()
+
+    hidden_size = int(model.javis.hidden_size)
+    num_queries = int(model.javis.num_queries)
+    sum_vec = torch.zeros((num_queries, hidden_size), device=device, dtype=torch.float32)
+    sumsq_vec = torch.zeros((num_queries, hidden_size), device=device, dtype=torch.float32)
+    count = torch.zeros((num_queries,), device=device, dtype=torch.float32)
+
+    saved: list[torch.Tensor] = []
+    seen_samples = 0
+
+    data_iter = iter(loader)
+    while seen_samples < int(num_samples):
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            data_iter = iter(loader)
+            batch = next(data_iter)
+
+        chunk_ids = batch.chunk_input_ids.to(device)
+        chunk_mask = batch.chunk_attention_mask.to(device)
+        bsz, num_chunks, chunk_len = chunk_ids.shape
+        seen_samples += int(bsz)
+
+        flat_ids = chunk_ids.view(bsz * num_chunks, chunk_len)
+        flat_mask = chunk_mask.view(bsz * num_chunks, chunk_len)
+
+        with torch.no_grad():
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+                outputs = model.compressor(input_ids=flat_ids, attention_mask=flat_mask)
+                hidden = outputs.last_hidden_state
+                x = model.javis.pre_kv_hidden(hidden)
+
+        segment_len = chunk_len // num_queries
+        for q_i in range(num_queries):
+            seg_start = q_i * segment_len
+            seg_end = (q_i + 1) * segment_len if q_i < num_queries - 1 else chunk_len
+            seg_mask = flat_mask[:, seg_start:seg_end].to(dtype=torch.bool)
+            seg_x = x[:, seg_start:seg_end, :]
+            seg_mask_flat = seg_mask.reshape(-1)
+            seg_x_flat = seg_x.reshape(-1, seg_x.size(-1))
+            seg_x_valid = seg_x_flat[seg_mask_flat]
+            if seg_x_valid.numel() > 0:
+                seg_x_float = seg_x_valid.float()
+                sum_vec[q_i] += seg_x_float.sum(dim=0)
+                sumsq_vec[q_i] += (seg_x_float * seg_x_float).sum(dim=0)
+                count[q_i] += float(seg_x_valid.size(0))
+                if save_path is not None:
+                    saved.append(seg_x_valid.detach().to("cpu"))
+
+    if use_dist and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(sum_vec, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(sumsq_vec, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM)
+
+    denom = count.clamp(min=1.0).unsqueeze(-1)
+    mean = sum_vec / denom
+    var = (sumsq_vec / denom) - (mean * mean)
+    var = var.clamp(min=0.0)
+    std = torch.sqrt(var + 1e-6)
+
+    with torch.no_grad():
+        q = torch.zeros((num_queries, hidden_size), device=device, dtype=mean.dtype)
+        basis = []
+        for q_i in range(num_queries):
+            vec = mean[q_i]
+            for prev in basis:
+                denom_proj = torch.dot(prev, prev) + 1e-8
+                vec = vec - (torch.dot(vec, prev) / denom_proj) * prev
+            scale = mean[q_i].norm() / (vec.norm() + 1e-8)
+            vec = vec * scale
+            vec = vec + std[q_i] * 1e-3 * torch.randn_like(vec)
+            q[q_i] = vec
+            basis.append(vec)
+
+        if use_dist and torch.distributed.is_initialized():
+            torch.distributed.broadcast(q, src=0)
+        model.javis.q.copy_(q.to(dtype=model.javis.q.dtype))
+
+    print(f"init q now {num_samples} {num_queries=}  {torch.distributed.is_initialized()=}  {torch.distributed.get_rank()=} \n" + "="*50)
+    
+    if not use_dist or (torch.distributed.is_initialized() and torch.distributed.get_rank() == 0):
+        import sys
+        with torch.no_grad():
+            q_final = model.javis.q.detach().float()
+            if num_queries > 1:
+                # 计算余弦相似度矩阵
+                norm_q = q_final / (q_final.norm(dim=1, keepdim=True) + 1e-8)
+                similarity_matrix = torch.matmul(norm_q, norm_q.T)
+                
+                print("\n" + "="*50)
+                print(f"🚀 Javis Query Initialization Diagnostic (num_queries={num_queries})")
+                print(f"📊 Cosine Similarity Matrix:\n{similarity_matrix}")
+                
+                # 提取 Q0 和 Q1 的相似度（针对 16:2）
+                if num_queries == 2:
+                    cos_sim = similarity_matrix[0, 1].item()
+                    print(f"🔍 Q0 <-> Q1 Similarity: {cos_sim:.6f} (Expect near 0.0)")
+                    print(f"🔍 Q0 <-> Q1 Similarity: {cos_sim:.6f}")
+                sys.stdout.flush()
+                print("="*50 + "\n")
+
+    if save_path is not None:
+        is_rank0 = True
+        if use_dist and torch.distributed.is_initialized():
+            is_rank0 = torch.distributed.get_rank() == 0
+        if is_rank0:
+            data = torch.cat(saved, dim=0) if saved else torch.empty((0, hidden_size))
+            out_path = Path(save_path)
+            if not out_path.is_absolute():
+                out_path = Path(os.getcwd()) / out_path
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"hidden": data, "mean": mean.cpu(), "std": std.cpu(), "q_init": model.javis.q.detach().cpu()}, out_path)
+
+    if model_was_training:
+        model.train()
 
 
 def configure_special_embedding_mode(args, model: IronCellModel, tokenizer, *, is_resume: bool) -> None:
@@ -271,4 +407,3 @@ def configure_special_embedding_mode(args, model: IronCellModel, tokenizer, *, i
 
     base_embed = model.generator.get_input_embeddings()
     base_embed.weight.requires_grad = False
-
