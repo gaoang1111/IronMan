@@ -69,6 +69,9 @@ class Javis(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_queries: int,
+        num_layers: int = 32,      # LLaMA-3 default
+        num_kv_heads: int = 8,     # LLaMA-3 8B GQA default
+        head_dim: int = 128,       # LLaMA-3 default
         ln_in_enabled: bool,
         ln_out_enabled: bool,
         init_noise_std: float,
@@ -78,6 +81,11 @@ class Javis(nn.Module):
         self.hidden_size = int(hidden_size)
         self.num_heads = int(num_heads)
         self.num_queries = int(num_queries)
+        
+        self.num_layers = int(num_layers)
+        self.num_kv_heads = int(num_kv_heads)
+        self.head_dim = int(head_dim)
+        
         self.ln_in_enabled = bool(ln_in_enabled)
         self.ln_out_enabled = bool(ln_out_enabled)
         self.init_noise_std = float(init_noise_std)
@@ -109,6 +117,48 @@ class Javis(nn.Module):
         _init_eye_plus_noise_(self.wo, std_noise=self.init_noise_std)
         self.current_q_grad_cos = None
 
+
+        # ==========================================
+        # Deep KV Injection Protocol (Giant Matrix)
+        # Target Dim: 32 layers * 2 (K,V) * 8 heads * 128 dim = 65536
+        # ==========================================
+        self.kv_dim_per_layer = self.num_kv_heads * self.head_dim
+        self.total_kv_proj_dim = self.num_layers * 2 * self.kv_dim_per_layer
+        
+        self.kv_proj = nn.Linear(self.hidden_size, self.total_kv_proj_dim, bias=False).to(dtype=dtype)
+        
+        std_dev = 1.0 / math.sqrt(self.hidden_size)  # 约 0.015625
+        nn.init.normal_(self.kv_proj.weight, mean=0.0, std=std_dev)
+
+    def get_all_layer_kv(self, v_out: torch.Tensor) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        """
+        Transforms the Javis 2-token output into LLaMA-3.1 strict past_key_values format.
+        Args:
+            v_out: Tensor of shape [B, num_queries, hidden_size]
+        Returns:
+            Tuple of length `num_layers`.
+            Each element is a tuple (K_tensor, V_tensor).
+            K/V shape: [B, num_kv_heads, num_queries, head_dim]
+        """
+        B, Q, _ = v_out.shape
+        
+        # [B, Q, 65536]
+        flat_kv = self.kv_proj(v_out)
+        
+        # Reshape: [B, Q, layers, 2(K/V), kv_heads, head_dim]
+        flat_kv = flat_kv.view(B, Q, self.num_layers, 2, self.num_kv_heads, self.head_dim)
+        
+        # Permute to isolate layers: [layers, 2, B, kv_heads, Q, head_dim]
+        flat_kv = flat_kv.permute(2, 3, 0, 4, 1, 5)
+        
+        past_key_values = []
+        for l in range(self.num_layers):
+            k = flat_kv[l, 0] # [B, num_kv_heads, Q, head_dim]
+            v = flat_kv[l, 1] # [B, num_kv_heads, Q, head_dim]
+            past_key_values.append((k, v))
+            
+        return tuple(past_key_values)
+    
     def pre_kv_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
         x = self.in_proj(hidden)
         if self.ln_in_enabled:
@@ -358,19 +408,42 @@ class IronCellModel(PreTrainedModel):
 
         self.config.special_token_ids = filtered_ids
 
+    # def compute_compressed_vectors(
+    #     self,
+    #     *,
+    #     chunk_input_ids: torch.LongTensor,  # [B,C,L]
+    #     chunk_attention_mask: torch.LongTensor,  # [B,C,L]
+    #     return_metrics: bool = False,
+    # ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, dict[str, float], torch.Tensor]:
+    #     """
+    #     Run compressor and projector to obtain compressed vectors V.
+
+    #     Returns:
+    #         vectors: [B, C, H_generator]
+    #     """
+    #     bsz, num_chunks, chunk_len = chunk_input_ids.shape
+    #     flat_ids = chunk_input_ids.view(bsz * num_chunks, chunk_len).to(self.device)
+    #     flat_mask = chunk_attention_mask.view(bsz * num_chunks, chunk_len).to(self.device)
+
+    #     do_no_grad = bool(self.config.freeze_compressor)
+    #     with torch.no_grad() if do_no_grad else torch.enable_grad():
+    #         outputs = self.compressor(input_ids=flat_ids, attention_mask=flat_mask)
+    #         hidden = outputs.last_hidden_state  # [B*C, L, Hc]
+
+    #     javis_out = self.javis(hidden, attention_mask=flat_mask, return_metrics=return_metrics)  # [B*C, Q, Hg]
+    #     if return_metrics:
+    #         javis_vecs, javis_metrics, current_out_cos = javis_out
+    #         return javis_vecs.view(bsz, num_chunks, self.javis.num_queries, -1), javis_metrics, current_out_cos
+    #     javis_vecs, current_out_cos = javis_out
+    #     return javis_vecs.view(bsz, num_chunks, self.javis.num_queries, -1), current_out_cos
+
     def compute_compressed_vectors(
         self,
         *,
-        chunk_input_ids: torch.LongTensor,  # [B,C,L]
-        chunk_attention_mask: torch.LongTensor,  # [B,C,L]
+        chunk_input_ids: torch.LongTensor,
+        chunk_attention_mask: torch.LongTensor,
         return_metrics: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, dict[str, float], torch.Tensor]:
-        """
-        Run compressor and projector to obtain compressed vectors V.
-
-        Returns:
-            vectors: [B, C, H_generator]
-        """
+    ):
         bsz, num_chunks, chunk_len = chunk_input_ids.shape
         flat_ids = chunk_input_ids.view(bsz * num_chunks, chunk_len).to(self.device)
         flat_mask = chunk_attention_mask.view(bsz * num_chunks, chunk_len).to(self.device)
@@ -380,13 +453,35 @@ class IronCellModel(PreTrainedModel):
             outputs = self.compressor(input_ids=flat_ids, attention_mask=flat_mask)
             hidden = outputs.last_hidden_state  # [B*C, L, Hc]
 
-        javis_out = self.javis(hidden, attention_mask=flat_mask, return_metrics=return_metrics)  # [B*C, Q, Hg]
+        # javis_out_flat: [B*C, Q, Hg]
         if return_metrics:
-            javis_vecs, javis_metrics, current_out_cos = javis_out
-            return javis_vecs.view(bsz, num_chunks, self.javis.num_queries, -1), javis_metrics, current_out_cos
-        javis_vecs, current_out_cos = javis_out
-        return javis_vecs.view(bsz, num_chunks, self.javis.num_queries, -1), current_out_cos
+            javis_out_flat, javis_metrics, current_out_cos = self.javis(hidden, attention_mask=flat_mask, return_metrics=True)
+        else:
+            javis_out_flat, current_out_cos = self.javis(hidden, attention_mask=flat_mask, return_metrics=False)
+            javis_metrics = None
 
+        # ==========================================
+        # 🔥 获取 32 层 Deep KV (核心改动)
+        # ==========================================
+        layer_kvs = self.javis.get_all_layer_kv(javis_out_flat) 
+        # layer_kvs: 32 elements of (K, V)
+        # K/V shape: [B*C, num_kv_heads, Q, head_dim]
+        
+        # 将 flat 的 K/V reshape 回 [B, C, ... ] 以便后续切片覆写
+        reshaped_layer_kvs = []
+        for l in range(self.javis.num_layers):
+            k_flat, v_flat = layer_kvs[l]
+            k_res = k_flat.view(bsz, num_chunks, self.javis.num_kv_heads, self.javis.num_queries, self.javis.head_dim)
+            v_res = v_flat.view(bsz, num_chunks, self.javis.num_kv_heads, self.javis.num_queries, self.javis.head_dim)
+            reshaped_layer_kvs.append((k_res, v_res))
+
+        javis_vecs = javis_out_flat.view(bsz, num_chunks, self.javis.num_queries, -1)
+
+        # 统一返回 Deep KV
+        if return_metrics:
+            return javis_out_flat, javis_vecs, reshaped_layer_kvs, javis_metrics, current_out_cos
+        return javis_out_flat, javis_vecs, reshaped_layer_kvs, current_out_cos
+        
     def build_inputs_embeds(
         self,
         *,
