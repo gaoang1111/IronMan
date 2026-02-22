@@ -34,6 +34,16 @@ PARALLEL=${PARALLEL:-ddp} # none|ddp|fsdp
 DDP_FIND_UNUSED=${DDP_FIND_UNUSED:-false}
 NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 
+WANDB_PROJECT=${WANDB_PROJECT:-soulbone}
+WANDB_RUN_NAME=${WANDB_RUN_NAME:-}
+WANDB_RUN_TAGS=${WANDB_RUN_TAGS:-}
+
+JAVIS_WARMUP_SAMPLES=${JAVIS_WARMUP_SAMPLES:-}
+JAVIS_WARMUP_SAVE_PATH=${JAVIS_WARMUP_SAVE_PATH:-}
+TEACHER_TARGETS_PATH=${TEACHER_TARGETS_PATH:-}
+DISTILL_LAYERS=${DISTILL_LAYERS:-}
+DISTILL_COEFF=${DISTILL_COEFF:-}
+
 args=(
   --model_name "$MODEL_NAME"
   --phase "$PHASE"
@@ -50,11 +60,19 @@ args=(
   --weight_decay "$WEIGHT_DECAY"
   --parallel "$PARALLEL"
   --ddp_find_unused_parameters "$DDP_FIND_UNUSED"
+  --wandb_project "$WANDB_PROJECT"
 )
 
 if [[ -n "${LR_PROJECTOR}" ]]; then args+=( --lr_projector "$LR_PROJECTOR" ); fi
 if [[ -n "${LR_GENERATOR}" ]]; then args+=( --lr_generator "$LR_GENERATOR" ); fi
 if [[ -n "${LR_COMPRESSOR}" ]]; then args+=( --lr_compressor "$LR_COMPRESSOR" ); fi
+if [[ -n "${TEACHER_TARGETS_PATH}" ]]; then args+=( --teacher_targets_path "$TEACHER_TARGETS_PATH" ); fi
+if [[ -n "${DISTILL_LAYERS}" ]]; then args+=( --distill_layers "$DISTILL_LAYERS" ); fi
+if [[ -n "${DISTILL_COEFF}" ]]; then args+=( --distill_coeff "$DISTILL_COEFF" ); fi
+if [[ -n "${WANDB_RUN_NAME}" ]]; then args+=( --wandb_run_name "$WANDB_RUN_NAME" ); fi
+if [[ -n "${WANDB_RUN_TAGS}" ]]; then args+=( --wandb_run_tags "$WANDB_RUN_TAGS" ); fi
+if [[ -n "${JAVIS_WARMUP_SAMPLES}" ]]; then args+=( --javis_query_warmup_samples "$JAVIS_WARMUP_SAMPLES" ); fi
+if [[ -n "${JAVIS_WARMUP_SAVE_PATH}" ]]; then args+=( --javis_query_warmup_save_path "$JAVIS_WARMUP_SAVE_PATH" ); fi
 
 if [[ -n "${RESUME_PATH}" ]]; then
   args+=( --resume_path "$RESUME_PATH" )

@@ -4,6 +4,6 @@
 
 __pycache__/
 
-
+wandb/
 *.pyo
 *.pyd

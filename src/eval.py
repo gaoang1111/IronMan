@@ -543,6 +543,8 @@ class TrainStepModule(nn.Module):
             
         self._register_grad_probe("memory_vectors", memory_vectors)
 
+        memory_vectors = torch.zeros_like(memory_vectors)
+
         # 2. 拼接底层的 inputs_embeds
         inputs_embeds = self.iron.build_inputs_embeds(
             zipper_input_ids=zipper_ids,
@@ -700,87 +702,87 @@ def main() -> None:
     model = load_model(args, tokenizer, device, is_resume=is_resume)
 
     # 3. 优化设置
-    model.generator.config.use_cache = False
-    model.generator.gradient_checkpointing_enable()
+    # model.generator.config.use_cache = False
+    # model.generator.gradient_checkpointing_enable()
     
-    if args.phase in ["phase2", "phase3", "phase-cmp", "phase-full"]:
-        print(f"--> Enabling Gradient Checkpointing for Compressor (Phase: {args.phase})...")
-        model.compressor.gradient_checkpointing_enable()
+    # if args.phase in ["phase2", "phase3", "phase-cmp", "phase-full"]:
+    #     print(f"--> Enabling Gradient Checkpointing for Compressor (Phase: {args.phase})...")
+    #     model.compressor.gradient_checkpointing_enable()
 
-    set_phase(model, args.phase)
-    configure_special_embedding_mode(args, model, tokenizer, is_resume=is_resume)
+    # set_phase(model, args.phase)
+    # configure_special_embedding_mode(args, model, tokenizer, is_resume=is_resume)
 
     # 4. 数据加载 (替换 toy text)
-    if not os.path.exists(args.data_path):
-        raise FileNotFoundError(f"Data file not found at {args.data_path}. Please run prepare_data.py first.")
+    # if not os.path.exists(args.data_path):
+    #     raise FileNotFoundError(f"Data file not found at {args.data_path}. Please run prepare_data.py first.")
         
-    dataset = JsonlDataset(args.data_path)
-    teacher_targets = None
-    if args.teacher_targets_path is not None and str(args.teacher_targets_path).strip() != "":
-        if not os.path.exists(args.teacher_targets_path):
-            raise FileNotFoundError(f"Teacher targets not found at {args.teacher_targets_path}")
-        teacher_pack = torch.load(args.teacher_targets_path, map_location="cpu")
-        if isinstance(teacher_pack, dict) and "targets" in teacher_pack:
-            teacher_targets = teacher_pack["targets"]
-        else:
-            teacher_targets = teacher_pack
+    # dataset = JsonlDataset(args.data_path)
+    # teacher_targets = None
+    # if args.teacher_targets_path is not None and str(args.teacher_targets_path).strip() != "":
+    #     if not os.path.exists(args.teacher_targets_path):
+    #         raise FileNotFoundError(f"Teacher targets not found at {args.teacher_targets_path}")
+    #     teacher_pack = torch.load(args.teacher_targets_path, map_location="cpu")
+    #     if isinstance(teacher_pack, dict) and "targets" in teacher_pack:
+    #         teacher_targets = teacher_pack["targets"]
+    #     else:
+    #         teacher_targets = teacher_pack
 
-    teacher_hidden_targets = None
-    teacher_hidden_valid_lens = None
-    teacher_hidden_target_layer = None
-    if args.teacher_hidden_targets_path is not None and str(args.teacher_hidden_targets_path).strip() != "":
-        if not os.path.exists(args.teacher_hidden_targets_path):
-            raise FileNotFoundError(f"Teacher hidden targets not found at {args.teacher_hidden_targets_path}")
-        print(f"--> [System] Memory-Mapping massive hidden targets from {args.teacher_hidden_targets_path}...")
-        hidden_pack = torch.load(
-            args.teacher_hidden_targets_path, 
-            map_location="cpu", 
-            mmap=True  
-        )
+    # teacher_hidden_targets = None
+    # teacher_hidden_valid_lens = None
+    # teacher_hidden_target_layer = None
+    # if args.teacher_hidden_targets_path is not None and str(args.teacher_hidden_targets_path).strip() != "":
+    #     if not os.path.exists(args.teacher_hidden_targets_path):
+    #         raise FileNotFoundError(f"Teacher hidden targets not found at {args.teacher_hidden_targets_path}")
+    #     print(f"--> [System] Memory-Mapping massive hidden targets from {args.teacher_hidden_targets_path}...")
+    #     hidden_pack = torch.load(
+    #         args.teacher_hidden_targets_path, 
+    #         map_location="cpu", 
+    #         mmap=True  
+    #     )
 
-        print(f"--> [Done]  hidden targets from {args.teacher_hidden_targets_path}...")
+        # print(f"--> [Done]  hidden targets from {args.teacher_hidden_targets_path}...")
         
-        if not (isinstance(hidden_pack, dict) and "targets" in hidden_pack and "valid_v_lens" in hidden_pack):
-            raise ValueError("teacher_hidden_targets_path must point to a dict with keys: targets, valid_v_lens, target_layer, chunk_size, q_num.")
-        teacher_hidden_targets = hidden_pack["targets"]
-        teacher_hidden_valid_lens = hidden_pack["valid_v_lens"]
-        teacher_hidden_target_layer = int(hidden_pack.get("target_layer", -1))
-        if teacher_hidden_target_layer < 0:
-            raise ValueError("Hidden distill pack missing target_layer.")
-        pack_chunk_size = int(hidden_pack.get("chunk_size", -1))
-        if pack_chunk_size > 0 and int(pack_chunk_size) != int(args.chunk_size):
-            raise ValueError(f"Hidden distill pack chunk_size={pack_chunk_size} mismatches args.chunk_size={args.chunk_size}.")
-        pack_q_num = int(hidden_pack.get("q_num", -1))
-        if pack_q_num > 0 and int(pack_q_num) != int(args.javis_num_queries):
-            raise ValueError(f"Hidden distill pack q_num={pack_q_num} mismatches args.javis_num_queries={args.javis_num_queries}.")
-    print(f"collator numv {args.javis_num_queries=}")
-    collator = IronCellCollator(
-        tokenizer,
-        chunk_size=args.chunk_size,
-        num_v=args.javis_num_queries,
-        random_gate=args.random_gate,
-        teacher_targets=teacher_targets,
-        teacher_hidden_targets=teacher_hidden_targets,
-        teacher_hidden_valid_lens=teacher_hidden_valid_lens,
-        teacher_hidden_target_layer=teacher_hidden_target_layer,
-    )
+        # if not (isinstance(hidden_pack, dict) and "targets" in hidden_pack and "valid_v_lens" in hidden_pack):
+        #     raise ValueError("teacher_hidden_targets_path must point to a dict with keys: targets, valid_v_lens, target_layer, chunk_size, q_num.")
+        # teacher_hidden_targets = hidden_pack["targets"]
+        # teacher_hidden_valid_lens = hidden_pack["valid_v_lens"]
+        # teacher_hidden_target_layer = int(hidden_pack.get("target_layer", -1))
+        # if teacher_hidden_target_layer < 0:
+        #     raise ValueError("Hidden distill pack missing target_layer.")
+        # pack_chunk_size = int(hidden_pack.get("chunk_size", -1))
+        # if pack_chunk_size > 0 and int(pack_chunk_size) != int(args.chunk_size):
+        #     raise ValueError(f"Hidden distill pack chunk_size={pack_chunk_size} mismatches args.chunk_size={args.chunk_size}.")
+        # pack_q_num = int(hidden_pack.get("q_num", -1))
+        # if pack_q_num > 0 and int(pack_q_num) != int(args.javis_num_queries):
+        #     raise ValueError(f"Hidden distill pack q_num={pack_q_num} mismatches args.javis_num_queries={args.javis_num_queries}.")
+    # print(f"collator numv {args.javis_num_queries=}")
+    # collator = IronCellCollator(
+    #     tokenizer,
+    #     chunk_size=args.chunk_size,
+    #     num_v=args.javis_num_queries,
+    #     random_gate=args.random_gate,
+    #     teacher_targets=teacher_targets,
+    #     teacher_hidden_targets=teacher_hidden_targets,
+    #     teacher_hidden_valid_lens=teacher_hidden_valid_lens,
+    #     teacher_hidden_target_layer=teacher_hidden_target_layer,
+    # )
 
     collator_eval = IronCellCollator(
         tokenizer,
         chunk_size=args.chunk_size,
         num_v=args.javis_num_queries,
-        random_gate=0,
-        teacher_targets=teacher_targets,
-        teacher_hidden_targets=teacher_hidden_targets,
-        teacher_hidden_valid_lens=teacher_hidden_valid_lens,
-        teacher_hidden_target_layer=teacher_hidden_target_layer,
+        random_gate=args.random_gate,
+        # teacher_targets=teacher_targets,
+        # teacher_hidden_targets=teacher_hidden_targets,
+        # teacher_hidden_valid_lens=teacher_hidden_valid_lens,
+        # teacher_hidden_target_layer=teacher_hidden_target_layer,
     )
-    if use_dist:
-        sampler = DistributedSampler(dataset, shuffle=True, drop_last=False)
-        loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, sampler=sampler, num_workers=0, collate_fn=collator)
-    else:
-        sampler = None
-        loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collator)
+    # if use_dist:
+    #     sampler = DistributedSampler(dataset, shuffle=True, drop_last=False)
+    #     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, sampler=sampler, num_workers=0, collate_fn=collator)
+    # else:
+    #     sampler = None
+    #     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collator)
 
     eval_loader = None
     eval_sampler = None
@@ -807,17 +809,17 @@ def main() -> None:
                 collate_fn=collator_eval,
             )
 
-    if args.phase == "phase1" and not is_resume:
-        warmup_init_javis_query(
-            model,
-            loader,
-            num_samples=getattr(model.config, "javis_query_warmup_samples", None),
-            save_path=getattr(model.config, "javis_query_warmup_save_path", None),
-            use_dist=use_dist,
-        )
+    # if args.phase == "phase1" and not is_resume:
+    #     warmup_init_javis_query(
+    #         model,
+    #         loader,
+    #         num_samples=getattr(model.config, "javis_query_warmup_samples", None),
+    #         save_path=getattr(model.config, "javis_query_warmup_save_path", None),
+    #         use_dist=use_dist,
+    #     )
 
-    print("Starting training...")
-    model.train()
+    print("Starting Eval...")
+    model.eval()
     total_micro_loss = 0.0
     total_micro_q_cos = 0.0
     total_micro_distill = 0.0
@@ -862,9 +864,9 @@ def main() -> None:
     step_impl = step_module.module if use_dist else step_module
     iron = step_impl.iron
 
-    lr_projector = float(args.lr_projector) if args.lr_projector is not None else float(args.lr)
-    lr_generator = float(args.lr_generator) if args.lr_generator is not None else float(args.lr)
-    lr_compressor = float(args.lr_compressor) if args.lr_compressor is not None else float(args.lr)
+    # lr_projector = float(args.lr_projector) if args.lr_projector is not None else float(args.lr)
+    # lr_generator = float(args.lr_generator) if args.lr_generator is not None else float(args.lr)
+    # lr_compressor = float(args.lr_compressor) if args.lr_compressor is not None else float(args.lr)
 
     seen: set[int] = set()
 
@@ -892,48 +894,46 @@ def main() -> None:
             out.append({"params": no_decay, "lr": float(lr), "weight_decay": 0.0})
         return out
 
-    param_groups = []
-    param_groups.extend(_append_param_groups(iron.javis.named_parameters(), prefix="javis", lr=lr_projector))
-    param_groups.extend(
-        _append_param_groups(iron.special_token_embeddings.named_parameters(), prefix="special_token_embeddings", lr=lr_projector)
-    )
-    param_groups.extend(_append_param_groups(iron.generator.named_parameters(), prefix="generator", lr=lr_generator))
-    param_groups.extend(_append_param_groups(iron.compressor.named_parameters(), prefix="compressor", lr=lr_compressor))
+    # param_groups = []
+    # param_groups.extend(_append_param_groups(iron.javis.named_parameters(), prefix="javis", lr=lr_projector))
+    # param_groups.extend(
+    #     _append_param_groups(iron.special_token_embeddings.named_parameters(), prefix="special_token_embeddings", lr=lr_projector)
+    # )
+    # param_groups.extend(_append_param_groups(iron.generator.named_parameters(), prefix="generator", lr=lr_generator))
+    # param_groups.extend(_append_param_groups(iron.compressor.named_parameters(), prefix="compressor", lr=lr_compressor))
 
-    if not param_groups:
-        raise ValueError("No trainable parameters found (all requires_grad=False).")
+    # if not param_groups:
+    #     raise ValueError("No trainable parameters found (all requires_grad=False).")
 
-    optimizer = torch.optim.AdamW(param_groups, lr=float(args.lr), weight_decay=0.0)
+    # optimizer = torch.optim.AdamW(param_groups, lr=float(args.lr), weight_decay=0.0)
 
-    if args.resume_path:
-        loaded_step = load_checkpoint(optimizer, args)
-    else:
-        loaded_step = 0
+    # if args.resume_path:
+    #     loaded_step = load_checkpoint(optimizer, args)
+    # else:
+    #     loaded_step = 0
 
-    if bool(args.reset_step_on_resume):
-        step = 0
-    else:
-        step = int(loaded_step)
+    # if bool(args.reset_step_on_resume):
+    #     step = 0
+    # else:
+    #     step = int(loaded_step)
 
-    base_lrs = [float(g.get("lr", float(args.lr))) for g in optimizer.param_groups]
+    # base_lrs = [float(g.get("lr", float(args.lr))) for g in optimizer.param_groups]
 
     # 6. 训练循环
     # 使用 iter(loader) 配合 while 循环可以防止 epoch 结束导致的重置，或者直接用 cycle
-    epoch = args.global_epoch
-    if sampler is not None:
-        sampler.set_epoch(epoch)
-    data_iter = iter(loader)
+    # epoch = args.global_epoch
+    # if sampler is not None:
+    #     sampler.set_epoch(epoch)
+    # data_iter = iter(loader)
     
-    grad_accum_steps = max(1, int(args.grad_accum_steps))
-    eval_steps = max(0, int(args.eval_steps))
-    eval_max_batches = max(0, int(args.eval_max_batches))
+    # grad_accum_steps = max(1, int(args.grad_accum_steps))
+    # eval_steps = max(0, int(args.eval_steps))
+    # eval_max_batches = max(0, int(args.eval_max_batches))
     if eval_sampler is not None:
         eval_sampler.set_epoch(0)
 
-    def _maybe_run_eval(*, step: int) -> float | None:
+    def _run_eval() -> float | None:
         if eval_loader is None:
-            return None
-        if eval_steps <= 0 or step % eval_steps != 0:
             return None
 
         step_module.eval()
@@ -941,8 +941,8 @@ def main() -> None:
         count = torch.zeros((), device=device, dtype=torch.float32)
         with torch.no_grad():
             for i, batch in enumerate(eval_loader):
-                if eval_max_batches > 0 and i >= eval_max_batches:
-                    break
+                # if eval_max_batches > 0 and i >= eval_max_batches:
+                #     break
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
                     loss, _, _, _ = step_module(batch, return_metrics=False)
                 sum_loss += loss.detach().float()
@@ -956,7 +956,13 @@ def main() -> None:
 
         denom = float(count.clamp(min=1.0).item())
         return float((sum_loss / denom).item())
-    while step < args.steps:
+
+    eval_loss = _run_eval()
+    if eval_loss is not None and is_rank0:
+        print(f"{'='*20}\n | EvalLoss: {eval_loss:.4f}  \n{'='*20}")
+        print("Eval finished.")
+    while 0:
+    # while step < args.steps:
         warmup_steps = max(0, int(args.warmup_steps))
         if warmup_steps > 0 and step < warmup_steps:
             warmup_factor = float(step + 1) / float(warmup_steps)
@@ -1054,7 +1060,7 @@ def main() -> None:
 
         
 
-        eval_loss = _maybe_run_eval(step=step)
+        eval_loss = _run_eval(step=step)
         if eval_loss is not None and is_rank0:
             print(f"[{args.phase}] Step {step} | EvalLoss: {eval_loss:.4f}")
             wandb.log({"eval/loss": eval_loss}, step=step)
@@ -1113,7 +1119,7 @@ def main() -> None:
                     to_save = step_module.module.iron if use_ddp else step_module.iron
                     save_checkpoint(to_save, optimizer, tokenizer, args, step)
 
-    print("Training finished.")
+    # print("Eval finished.")
     if is_rank0:
         wandb.finish()
 

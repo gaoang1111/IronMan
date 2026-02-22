@@ -28,6 +28,9 @@ class ZipperBatch:
         prefix_lens: [B] prefix length (SOC + (V,EOC)*C).
         valid_lens: [B] unpadded zipper length.
         teacher_attn_targets: [B, T] teacher attention targets (optional).
+        teacher_hidden_targets: [B, V, H] teacher hidden targets for V slots (optional).
+        valid_v_lens: [B] number of valid V slots in teacher_hidden_targets (optional).
+        teacher_hidden_target_layer: scalar int tensor; teacher target layer (optional).
     """
 
     zipper_input_ids: torch.LongTensor
@@ -40,6 +43,9 @@ class ZipperBatch:
     prefix_lens: torch.LongTensor
     valid_lens: torch.LongTensor
     teacher_attn_targets: torch.FloatTensor
+    teacher_hidden_targets: torch.FloatTensor
+    valid_v_lens: torch.LongTensor
+    teacher_hidden_target_layer: torch.LongTensor
 
 
 def _chunk_list(token_ids: list[int], chunk_size: int) -> list[list[int]]:
@@ -187,6 +193,7 @@ def build_zipper_labels(
     left_over: int,
     num_v: int = 1,
     ignore_index: int = -100,
+    random_gate: float = 0,
 ) -> torch.Tensor:
     num_raw_segments = num_chunks + (1 if left_over > 0 else 0)
     num_control_groups = num_raw_segments
@@ -204,9 +211,16 @@ def build_zipper_labels(
     raw_phys_start = prefix_len
     labels = torch.full_like(input_ids, ignore_index)
 
+    import random
+    if random.random() < random_gate:
+        visible_len = 3
+    else:
+        visible_len = chunk_size
     for k in range(num_raw_segments):
         curr_start = raw_phys_start + k * chunk_size
-        curr_end = min(curr_start + chunk_size, valid_len)
+        # curr_end = min(curr_start + chunk_size, valid_len)
+
+        curr_end = min(curr_start + chunk_size, valid_len, curr_start + visible_len)
         chunk_len = curr_end - curr_start
 
         if chunk_len > 1:
@@ -235,12 +249,14 @@ class ZipperBuilder:
         chunk_size: int,
         buffer_size: int = 0,
         num_v: int = 1,
+        random_gate: float = 0,
     ) -> None:
         self.tokenizer = tokenizer
         self.prompt = prompt
         self.chunk_size = int(chunk_size)
         self.buffer_size = int(buffer_size)
         self.num_v = int(num_v)
+        self.random_gate = float(random_gate)
 
         if self.chunk_size <= 0:
             raise ValueError(f"chunk_size must be > 0, got {self.chunk_size}")
@@ -310,6 +326,7 @@ class ZipperBuilder:
             chunk_size=self.chunk_size,
             left_over=self.left_over,
             num_v=self.num_v,
+            random_gate=self.random_gate,
         )
 
     def build_gen_attention_and_pos(
@@ -343,14 +360,22 @@ class IronCellCollator:
         pad_to_multiple_of: int | None = 8,
         buffer_size: int = 0,
         num_v: int = 1,
+        random_gate: float = 0,
         teacher_targets: torch.Tensor | None = None,
+        teacher_hidden_targets: torch.Tensor | None = None,
+        teacher_hidden_valid_lens: torch.Tensor | None = None,
+        teacher_hidden_target_layer: int | None = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.chunk_size = int(chunk_size)
         self.pad_to_multiple_of = pad_to_multiple_of
         self.buffer_size = int(buffer_size)
         self.num_v = int(num_v)
+        self.random_gate = float(random_gate)
         self.teacher_targets = teacher_targets
+        self.teacher_hidden_targets = teacher_hidden_targets
+        self.teacher_hidden_valid_lens = teacher_hidden_valid_lens
+        self.teacher_hidden_target_layer = teacher_hidden_target_layer
 
     def __call__(self, items: Sequence[object]) -> ZipperBatch:
         if len(items) == 0:
@@ -372,6 +397,7 @@ class IronCellCollator:
                 chunk_size=self.chunk_size,
                 buffer_size=self.buffer_size,
                 num_v=self.num_v,
+                random_gate=self.random_gate,
             )
             for text in texts
         ]
@@ -415,6 +441,22 @@ class IronCellCollator:
         else:
             teacher_attn_targets = torch.zeros((len(texts), 0), dtype=torch.float32, device=device)
 
+        if self.teacher_hidden_targets is not None:
+            if idxs_t is None:
+                raise ValueError("teacher_hidden_targets requires dataset indices.")
+            if self.teacher_hidden_valid_lens is None:
+                raise ValueError("teacher_hidden_valid_lens is required when teacher_hidden_targets is set.")
+            teacher_hidden_targets = self.teacher_hidden_targets.index_select(0, idxs_t).to(dtype=torch.float32)
+            valid_v_lens = self.teacher_hidden_valid_lens.index_select(0, idxs_t).to(dtype=torch.long)
+        else:
+            teacher_hidden_targets = torch.zeros((len(texts), 0, 0), dtype=torch.float32, device=device)
+            valid_v_lens = torch.zeros((len(texts),), dtype=torch.long, device=device)
+        teacher_hidden_target_layer = torch.tensor(
+            -1 if self.teacher_hidden_target_layer is None else int(self.teacher_hidden_target_layer),
+            dtype=torch.long,
+            device=device,
+        )
+
         for b, builder in enumerate(builders):
             valid_len = builder.valid_len
             prefix_len = builder.prefix_len
@@ -452,4 +494,7 @@ class IronCellCollator:
             prefix_lens=prefix_lens,
             valid_lens=valid_lens,
             teacher_attn_targets=teacher_attn_targets,
+            teacher_hidden_targets=teacher_hidden_targets,
+            valid_v_lens=valid_v_lens,
+            teacher_hidden_target_layer=teacher_hidden_target_layer,
         )

@@ -54,7 +54,7 @@ def resize_and_smart_init_special_tokens(
     tokenizer: PreTrainedTokenizerBase,
     tokens: IronCellSpecialTokens = IronCellSpecialTokens(),
     soc_init_candidates: Iterable[str] = ("Summary", "Note"),
-    eoc_init_text: str = "\n",
+    eoc_init_text: str = ":",
     v_none_init_text: str = "none",
     std_noise: float = 1e-3,
 ) -> None:
