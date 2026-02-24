@@ -250,6 +250,7 @@ class ZipperBuilder:
         buffer_size: int = 0,
         num_v: int = 1,
         random_gate: float = 0,
+        truncate_len: int | None = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.prompt = prompt
@@ -274,7 +275,9 @@ class ZipperBuilder:
         if self.soc_id < 0 or self.eoc_id < 0 or self.v_none_id < 0:
             raise ValueError("Special tokens not found in tokenizer; call add_iron_cell_special_tokens first.")
 
-        self.raw_core_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        self.raw_core_ids = tokenizer.encode(
+            prompt, add_special_tokens=False, max_length=truncate_len, truncation=True
+        )
         self.raw_len = len(self.raw_core_ids)
 
         self.num_chunks = self.raw_len // self.chunk_size
@@ -361,6 +364,7 @@ class IronCellCollator:
         buffer_size: int = 0,
         num_v: int = 1,
         random_gate: float = 0,
+        truncate_len: int | None = None,
         teacher_targets: torch.Tensor | None = None,
         teacher_hidden_targets: torch.Tensor | None = None,
         teacher_hidden_valid_lens: torch.Tensor | None = None,
@@ -372,6 +376,7 @@ class IronCellCollator:
         self.buffer_size = int(buffer_size)
         self.num_v = int(num_v)
         self.random_gate = float(random_gate)
+        self.truncate_len = truncate_len
         self.teacher_targets = teacher_targets
         self.teacher_hidden_targets = teacher_hidden_targets
         self.teacher_hidden_valid_lens = teacher_hidden_valid_lens
@@ -398,6 +403,7 @@ class IronCellCollator:
                 buffer_size=self.buffer_size,
                 num_v=self.num_v,
                 random_gate=self.random_gate,
+                truncate_len=self.truncate_len,
             )
             for text in texts
         ]

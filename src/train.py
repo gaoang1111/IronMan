@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import wandb  # [Added] 引入 WandB
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from torch.nn.utils import clip_grad_norm_
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -53,10 +53,13 @@ class TrainArgs:
     load_weights_only: bool = False
     chunk_size: int = 16
     batch_size: int = 2  # A800 上可以尝试大一点，比如 4 或 8
+    buffer_num: int = 1
+    truncate_len: int | None = None
     lr: float = 5e-5
     lr_projector: float | None = None
     lr_generator: float | None = None
     lr_compressor: float | None = None
+    lr_javis_gate: float | None = None
     clip_grad_norm: float | None = 1.0
     weight_decay: float = 0.0
     parallel: str = "none"  # none|ddp|fsdp
@@ -83,7 +86,9 @@ class TrainArgs:
     javis_query_warmup_samples: int | None = 100
     javis_query_warmup_save_path: str | None = None
     javis_num_queries: int = 2
+    javis_query_group_size: int = 1
     javis_q_cos_coeff: float = 1.0
+    javis_target_layers: list[int] = field(default_factory=lambda: [15, 23, 31])
     wandb_project: str = "soulbone" 
     wandb_run_name: str | None = None
     wandb_run_tags: str | None = None
@@ -92,6 +97,16 @@ class TrainArgs:
 
 def set_phase(model: IronCellModel, phase: str) -> None:
     print(f"--> Setting model to {phase} mode...")
+    # if phase == "phase1":
+    #     model.freeze_for_phase_1()
+    #     # 双重保险：确保 config 状态正确
+    #     model.config.freeze_compressor = True
+    #     # 手动冻结 Compressor
+    #     for p in model.compressor.parameters():
+    #         p.requires_grad = False
+    #     for name, p in model.generator.named_parameters():
+    #         if "norm" in name: 
+    #             p.requires_grad = True
     if phase == "phase1":
         model.freeze_for_phase_1()
         # 双重保险：确保 config 状态正确
@@ -99,6 +114,12 @@ def set_phase(model: IronCellModel, phase: str) -> None:
         # 手动冻结 Compressor
         for p in model.compressor.parameters():
             p.requires_grad = False
+        for name, p in model.generator.named_parameters():
+            if "norm" in name: 
+                p.requires_grad = True
+        if hasattr(model, "javis"):
+            model.javis.layer_gates.requires_grad = False
+            # model.javis.layer_gates.data.fill_(0.07)
     elif phase == "phase2":
         model.config.freeze_compressor = False
         # 全量解冻
@@ -119,6 +140,9 @@ def set_phase(model: IronCellModel, phase: str) -> None:
         model.freeze_for_phase_1()
         for p in model.compressor.parameters():
             p.requires_grad = True
+        for name, p in model.generator.named_parameters():
+            if "norm" in name: 
+                p.requires_grad = True
     else:
         raise ValueError(f"Unknown phase: {phase}")
 
@@ -156,17 +180,20 @@ def main() -> None:
         if args.wandb_run_tags is not None and str(args.wandb_run_tags).strip() != "":
             tags = [t.strip() for t in str(args.wandb_run_tags).split(",") if t.strip()]
         wandb.init(project=str(args.wandb_project), name=run_name, tags=tags, config=args)
-
-    tokenizer, is_resume = load_tokenizer(args)
-    model = load_model(args, tokenizer, device, is_resume=is_resume)
-
-    # 3. 优化设置
-    model.generator.config.use_cache = False
-    model.generator.gradient_checkpointing_enable()
     
+    # # 3. 优化设置
+    # model.generator.config.use_cache = False
+    # model.generator.gradient_checkpointing_enable()
+    
+    # if args.phase in ["phase2", "phase3", "phase-cmp", "phase-full"]:
+    #     print(f"--> Enabling Gradient Checkpointing for Compressor (Phase: {args.phase})...")
+    #     model.compressor.gradient_checkpointing_enable()
+
+
+    model.generator.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     if args.phase in ["phase2", "phase3", "phase-cmp", "phase-full"]:
         print(f"--> Enabling Gradient Checkpointing for Compressor (Phase: {args.phase})...")
-        model.compressor.gradient_checkpointing_enable()
+        model.compressor.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
     set_phase(model, args.phase)
     configure_special_embedding_mode(args, model, tokenizer, is_resume=is_resume)
@@ -219,6 +246,7 @@ def main() -> None:
         tokenizer,
         chunk_size=args.chunk_size,
         num_v=args.javis_num_queries,
+        truncate_len=args.truncate_len,
         random_gate=args.random_gate,
         teacher_targets=teacher_targets,
         teacher_hidden_targets=teacher_hidden_targets,
@@ -231,6 +259,7 @@ def main() -> None:
         chunk_size=args.chunk_size,
         num_v=args.javis_num_queries,
         random_gate=0,
+        truncate_len=args.truncate_len,
         teacher_targets=teacher_targets,
         teacher_hidden_targets=teacher_hidden_targets,
         teacher_hidden_valid_lens=teacher_hidden_valid_lens,
@@ -287,8 +316,10 @@ def main() -> None:
 
     micro_count = 0
     
-
-    from src.hack_llama import TrainStepModuleForFullLayersKVInjection as TrainStepModule
+    if use_ddp:
+        from src.hack_llama_ddp import TrainStepModuleForFullLayersKVInjection as TrainStepModule
+    elif use_fsdp:
+        from src.hack_llama_fsdp import TrainStepModuleForFullLayersKVInjection as TrainStepModule
     step_module = TrainStepModule(
         model,
         phase=args.phase,
@@ -296,6 +327,7 @@ def main() -> None:
         chunk_size=args.chunk_size,
     )
     step_module.grad_probe = bool(args.grad_probe)
+    step_module.to(torch.bfloat16)
     if use_fsdp:
         mp = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16)
         cpu_offload = CPUOffload(offload_params=True) if bool(args.fsdp_cpu_offload) else None
@@ -325,7 +357,7 @@ def main() -> None:
     lr_projector = float(args.lr_projector) if args.lr_projector is not None else float(args.lr)
     lr_generator = float(args.lr_generator) if args.lr_generator is not None else float(args.lr)
     lr_compressor = float(args.lr_compressor) if args.lr_compressor is not None else float(args.lr)
-
+    lr_javis_gate = float(args.lr_javis_gate) if args.lr_javis_gate is not None else float(args.lr)
     seen: set[int] = set()
 
     def _append_param_groups(named_params, *, prefix: str, lr: float) -> list[dict]:
@@ -353,7 +385,22 @@ def main() -> None:
         return out
 
     param_groups = []
-    param_groups.extend(_append_param_groups(iron.javis.named_parameters(), prefix="javis", lr=lr_projector))
+    # param_groups.extend(_append_param_groups(iron.javis.named_parameters(), prefix="javis", lr=lr_projector))
+    
+    javis_gate_params = []
+    javis_base_params = []
+    for n, p in iron.javis.named_parameters():
+        if "layer_gates" in n:
+            javis_gate_params.append((n, p))
+        else:
+            javis_base_params.append((n, p))
+
+    # 常规矩阵参数保持 1e-5 (lr_projector)
+    param_groups.extend(_append_param_groups(javis_base_params, prefix="javis", lr=lr_projector))
+    # Gate 标量参数单独给 1e-2 (放大 1000 倍)
+    param_groups.extend(_append_param_groups(javis_gate_params, prefix="javis_gates", lr=lr_javis_gate))
+
+
     param_groups.extend(
         _append_param_groups(iron.special_token_embeddings.named_parameters(), prefix="special_token_embeddings", lr=lr_projector)
     )
@@ -416,6 +463,11 @@ def main() -> None:
 
         denom = float(count.clamp(min=1.0).item())
         return float((sum_loss / denom).item())
+
+    if is_rank0:
+        print(f"[DEBUG] LM Head requires_grad: {step_module.iron.generator.lm_head.weight.requires_grad}")
+        print(f"[DEBUG] Layer 10 requires_grad: {step_module.iron.generator.model.layers[10].self_attn.q_proj.weight.requires_grad}")
+        print(f"[DEBUG] Javis Gate requires_grad: {step_module.iron.javis.layer_gates.requires_grad}")
     while step < args.steps:
         warmup_steps = max(0, int(args.warmup_steps))
         if warmup_steps > 0 and step < warmup_steps:
@@ -457,7 +509,7 @@ def main() -> None:
                     last_l2_loss = l2_loss
                     (loss / grad_accum_steps).backward()
 
-                    step_impl.manual_backward_sync(grad_accum_steps)
+                    # step_impl.manual_backward_sync(grad_accum_steps)
 
             total_micro_loss += float(loss.item())
             total_micro_q_cos += float(current_out_cos.item())

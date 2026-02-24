@@ -69,6 +69,7 @@ class Javis(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_queries: int,
+        query_group_size: int,
         num_layers: int = 32,      # LLaMA-3 default
         num_kv_heads: int = 8,     # LLaMA-3 8B GQA default
         head_dim: int = 128,       # LLaMA-3 default
@@ -81,7 +82,10 @@ class Javis(nn.Module):
         self.hidden_size = int(hidden_size)
         self.num_heads = int(num_heads)
         self.num_queries = int(num_queries)
-        
+        assert num_layers % query_group_size == 0, f"num_queries must be divisible by query_group_size, got {num_queries} % {query_group_size}"
+        self.query_group_size = int(query_group_size)
+        self.num_query_group = int(num_layers // query_group_size)
+
         self.num_layers = int(num_layers)
         self.num_kv_heads = int(num_kv_heads)
         self.head_dim = int(head_dim)
@@ -103,9 +107,14 @@ class Javis(nn.Module):
             self.in_proj = nn.Identity()
 
         self.ln_in = nn.LayerNorm(self.hidden_size, elementwise_affine=True).to(dtype=dtype)
-        self.ln_out = nn.LayerNorm(self.hidden_size, elementwise_affine=True).to(dtype=dtype)
+        # self.ln_out = nn.LayerNorm(self.hidden_size, elementwise_affine=True).to(dtype=dtype)
+        self.group_ln_out = nn.ModuleList([
+                nn.LayerNorm(self.hidden_size, dtype=dtype) for _ in range(self.num_query_group)
+            ])
+        
+        # self.q = nn.Parameter(torch.empty((self.num_queries, self.hidden_size), dtype=dtype))
+        self.q = nn.Parameter(torch.empty((self.num_query_group, num_queries, hidden_size), dtype=dtype))
 
-        self.q = nn.Parameter(torch.empty((self.num_queries, self.hidden_size), dtype=dtype))
         nn.init.normal_(self.q, mean=0.0, std=1.0)
 
         self.wk = nn.Linear(self.hidden_size, self.hidden_size, bias=False).to(dtype=dtype)
@@ -122,42 +131,71 @@ class Javis(nn.Module):
         # Deep KV Injection Protocol (Giant Matrix)
         # Target Dim: 32 layers * 2 (K,V) * 8 heads * 128 dim = 65536
         # ==========================================
-        self.kv_dim_per_layer = self.num_kv_heads * self.head_dim
-        self.total_kv_proj_dim = self.num_layers * 2 * self.kv_dim_per_layer
-        
-        self.kv_proj = nn.Linear(self.hidden_size, self.total_kv_proj_dim, bias=False).to(dtype=dtype)
-        
-        std_dev = 1.0 / math.sqrt(self.hidden_size)  # 约 0.015625
-        nn.init.normal_(self.kv_proj.weight, mean=0.0, std=std_dev)
+        # 每个 Layer 需要的 KV 维度
+        self.kv_dim_per_layer = self.num_kv_heads * self.head_dim * 2 # K + V
 
-    def get_all_layer_kv(self, v_out: torch.Tensor) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        # 核心改动：定义 32 个独立的投影矩阵，或者一个 3D Tensor
+        # Shape: [32, hidden_size, kv_dim_per_layer]
+        self.kv_proj_weights = nn.Parameter(torch.empty(self.num_layers, self.hidden_size, self.kv_dim_per_layer))
+
+        # 初始化：每一层都独立 init，确保多样性
+        std_dev = 1.0 / math.sqrt(self.hidden_size)
+        nn.init.normal_(self.kv_proj_weights, mean=0.0, std=std_dev)
+
+        self.layer_gates = nn.Parameter(torch.full((self.num_layers,), 0.07))
+        # self.javis_gate = nn.Parameter(torch.zeros(1))
+
+        
+
+    def get_all_layer_kv(self, v_out_blocks: torch.Tensor) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
         """
-        Transforms the Javis 2-token output into LLaMA-3.1 strict past_key_values format.
         Args:
-            v_out: Tensor of shape [B, num_queries, hidden_size]
-        Returns:
-            Tuple of length `num_layers`.
-            Each element is a tuple (K_tensor, V_tensor).
-            K/V shape: [B, num_kv_heads, num_queries, head_dim]
+            v_out_blocks: Tensor of shape [B, G, Q, H]
         """
-        B, Q, _ = v_out.shape
+        B, G, Q, H = v_out_blocks.shape
+        L = self.num_layers
+        L_per_G = L // G
         
-        # [B, Q, 65536]
-        flat_kv = self.kv_proj(v_out)
+        # 1. 扩展组维度以对齐层数：[B, G, 1, Q, H] -> [B, G, L_per_G, Q, H]
+        v_expanded = v_out_blocks.unsqueeze(2).expand(-1, -1, L_per_G, -1, -1)
         
-        # Reshape: [B, Q, layers, 2(K/V), kv_heads, head_dim]
-        flat_kv = flat_kv.view(B, Q, self.num_layers, 2, self.num_kv_heads, self.head_dim)
+        # 2. Reshape 并转置，压实显存 [B, L, Q, H] -> [L, B, Q, H]
+        v_aligned = v_expanded.reshape(B, L, Q, H).transpose(0, 1).contiguous()
         
-        # Permute to isolate layers: [layers, 2, B, kv_heads, Q, head_dim]
-        flat_kv = flat_kv.permute(2, 3, 0, 4, 1, 5)
+        # ==========================================
+        # 🚀 致命 OOM 修复处：显式 BMM 矩阵运算
+        # ==========================================
+        # v_bmm: [L, B*Q, H]
+        v_bmm = v_aligned.view(L, B * Q, H)
         
+        # kv_proj_weights: [L, H, KV_dim]
+        # BMM: [L, B*Q, H] @ [L, H, KV_dim] -> [L, B*Q, KV_dim]
+        flat_kv = torch.bmm(v_bmm, self.kv_proj_weights)
+        
+        # 恢复形状: [L, B, Q, KV_dim] -> [B, L, Q, KV_dim]
+        flat_kv = flat_kv.view(L, B, Q, self.kv_dim_per_layer).transpose(0, 1)
+        # ==========================================
+        
+        # 3. Reshape 到 LLaMA 规格
+        # [B, L, Q, 2, num_kv_heads, head_dim]
+        flat_kv = flat_kv.view(B, L, Q, 2, self.num_kv_heads, self.head_dim)
+        
+        # 4. Permute 切分维度: [L, 2, B, num_kv_heads, Q, head_dim]
+        flat_kv = flat_kv.permute(1, 3, 0, 4, 2, 5)
+        
+        gates = self.layer_gates.view(L, 1, 1, 1, 1, 1).to(flat_kv.dtype)
+        # 这一步，32 层的 KV 已经被各自专属的 gate 缩放过了！
+        flat_kv = flat_kv * gates
+
         past_key_values = []
-        for l in range(self.num_layers):
+        for l in range(L):
             k = flat_kv[l, 0] # [B, num_kv_heads, Q, head_dim]
             v = flat_kv[l, 1] # [B, num_kv_heads, Q, head_dim]
             past_key_values.append((k, v))
             
         return tuple(past_key_values)
+
+    
     
     def pre_kv_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
         x = self.in_proj(hidden)
@@ -165,7 +203,123 @@ class Javis(nn.Module):
             x = self.ln_in(x)
         return x
 
+    
     def forward(
+        self,
+        hidden: torch.Tensor,
+        *,
+        attention_mask: torch.Tensor | None = None,
+        return_metrics: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, dict[str, float], torch.Tensor]:
+        
+        x = self.pre_kv_hidden(hidden) # [B, L, H]
+        k_full = self.wk(x)            # [B, L, H]
+        v_full = self.wv(x)            # [B, L, H]
+
+        B = int(x.size(0))
+        G = self.num_query_group
+        Q_len = self.num_queries
+        seq_len = int(k_full.size(1))
+        
+        # q_tensor: [B, G, Q, H]
+        q_tensor = self.q.unsqueeze(0).expand(B, -1, -1, -1)
+        
+        # --- 注册 Hook 监控正交度 ---
+        if self.training and return_metrics and q_tensor.requires_grad:
+            def _q_grad_hook(grad: torch.Tensor) -> None:
+                grad_q0 = grad[:, :, 0, :].float()
+                grad_q1 = grad[:, :, 1, :].float()
+                cos_sim = F.cosine_similarity(grad_q0, grad_q1, dim=-1, eps=1e-8).mean()
+                self.current_q_grad_cos = float(cos_sim.item())
+            q_tensor.register_hook(_q_grad_hook)
+
+        h_heads = self.num_heads
+        d_k = self.hidden_size // h_heads
+
+        # ==========================================
+        # 🚀 绝杀显存：原生高维广播，彻底消灭 reshape 复制
+        # ==========================================
+        # q: [B, G, Q, h, d] -> [B, G, h, Q, d]
+        q = q_tensor.view(B, G, Q_len, h_heads, d_k).transpose(2, 3)
+        
+        # k, v: [B, L_seq, h, d] -> 扩增组维度G -> [B, 1, h, L_seq, d] 
+        k = k_full.view(B, seq_len, h_heads, d_k).unsqueeze(1).permute(0, 1, 3, 2, 4)
+        v = v_full.view(B, seq_len, h_heads, d_k).unsqueeze(1).permute(0, 1, 3, 2, 4)
+
+        # Attention: [B, G, h, Q, d] @ [B, 1, h, d, L_seq] -> [B, G, h, Q, L_seq]
+        logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k)
+        
+        if attention_mask is not None:
+            m = attention_mask.to(dtype=torch.bool, device=logits.device)
+            m = m.view(B, 1, 1, 1, seq_len)
+            logits = logits.masked_fill(~m, torch.finfo(logits.dtype).min)
+
+        attn = torch.softmax(logits.float(), dim=-1).to(dtype=logits.dtype)
+        
+        # Context: [B, G, h, Q, L_seq] @ [B, 1, h, L_seq, d] -> [B, G, h, Q, d]
+        ctx = torch.matmul(attn, v)
+        
+        # 还原回 [B, G, Q, H]
+        ctx = ctx.transpose(2, 3).contiguous().view(B, G, Q_len, self.hidden_size)
+        
+        # ==========================================
+
+        # 输出投射与 Group LayerNorm
+        out = self.wo(ctx) # [B, G, Q, H]
+        
+        if getattr(self, "ln_out_enabled", False):
+            outs = []
+            for g in range(G):
+                outs.append(self.group_ln_out[g](out[:, g, :, :]))
+            out = torch.stack(outs, dim=1) # [B, G, Q, H]
+
+        # Shortcut 和 余弦相似度计算
+        current_out_cos = torch.zeros((), device=out.device, dtype=out.dtype)
+        if Q_len >= 2:
+            current_out_cos = F.cosine_similarity(out[:, :, 0, :], out[:, :, 1, :], dim=-1, eps=1e-8).mean()
+
+        global_mean = hidden.mean(dim=1, keepdim=True) # [B, 1, H]
+        shortcut = global_mean.view(B, 1, 1, self.hidden_size).expand(-1, G, Q_len, -1)
+        final_out = out + shortcut * 0.5
+
+        # Metrics 收集 (无缝适配高维 attn)
+        metrics: dict[str, float] | None = None
+        if return_metrics:
+            metrics = {}
+            with torch.no_grad():
+                out_detached = out.detach().float()
+                mean_detached = global_mean.detach().float()
+                out_pair = out_detached[:, :, :2, :]
+                norm_out = out_pair.norm(p=2, dim=-1).mean()
+                norm_mean = mean_detached.norm(p=2, dim=-1).mean()
+                metrics["javis_norm_ratio"] = float((norm_out / (norm_mean + 1e-9)).item())
+                metrics["javis_out_cos"] = float(current_out_cos.item())
+                
+                token_len = min(16, seq_len)
+                if token_len > 0 and Q_len >= 2:
+                    attn_detached = attn.detach().float() # 已经是 [B, G, h, Q, L]
+                    attn_q0 = attn_detached[:, :, :, 0, :token_len].mean(dim=(1, 2)) 
+                    attn_q1 = attn_detached[:, :, :, 1, :token_len].mean(dim=(1, 2))
+                    kl_div = F.kl_div((attn_q1 + 1e-9).log(), attn_q0, reduction="batchmean")
+                    metrics["javis_attn_kl"] = float(kl_div.item())
+                
+                target_layers = [15, 23, 31]
+                gates_val = self.layer_gates.detach().float()
+                
+                # 记录这三层的平均值
+                metrics["javis_gate_avg_target"] = float(gates_val[target_layers].mean().item())
+                # 如果你想看得更细，可以分别记录：
+                metrics["javis_gate_15"] = float(gates_val[15].item())
+                metrics["javis_gate_23"] = float(gates_val[23].item())
+                metrics["javis_gate_31"] = float(gates_val[31].item())
+
+        if return_metrics:
+            return final_out, metrics, current_out_cos
+        return final_out, current_out_cos
+
+
+
+    def _forward(
         self,
         hidden: torch.Tensor,
         *,
@@ -245,6 +399,34 @@ class Javis(nn.Module):
             return final_out, metrics, current_out_cos
         return final_out, current_out_cos
 
+    def _get_all_layer_kv(self, v_out: torch.Tensor) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        """
+        Transforms the Javis 2-token output into LLaMA-3.1 strict past_key_values format.
+        Args:
+            v_out: Tensor of shape [B, num_queries, hidden_size]
+        Returns:
+            Tuple of length `num_layers`.
+            Each element is a tuple (K_tensor, V_tensor).
+            K/V shape: [B, num_kv_heads, num_queries, head_dim]
+        """
+        B, Q, _ = v_out.shape
+        
+        # [B, Q, 65536]
+        flat_kv = self.kv_proj(v_out)
+        
+        # Reshape: [B, Q, layers, 2(K/V), kv_heads, head_dim]
+        flat_kv = flat_kv.view(B, Q, self.num_layers, 2, self.num_kv_heads, self.head_dim)
+        
+        # Permute to isolate layers: [layers, 2, B, kv_heads, Q, head_dim]
+        flat_kv = flat_kv.permute(2, 3, 0, 4, 1, 5)
+        
+        past_key_values = []
+        for l in range(self.num_layers):
+            k = flat_kv[l, 0] # [B, num_kv_heads, Q, head_dim]
+            v = flat_kv[l, 1] # [B, num_kv_heads, Q, head_dim]
+            past_key_values.append((k, v))
+            
+        return tuple(past_key_values)
 
 class IronCellModel(PreTrainedModel):
     """
@@ -291,6 +473,8 @@ class IronCellModel(PreTrainedModel):
 
         num_heads = int(getattr(config, "javis_num_heads", 16))
         num_queries = int(getattr(config, "javis_num_queries", 1))
+        query_group_size = int(getattr(config, "javis_query_group_size", 1))
+
         ln_in_enabled = bool(getattr(config, "javis_ln_in", True))
         ln_out_enabled = bool(getattr(config, "javis_ln_out", True))
         init_noise_std = float(getattr(config, "javis_init_noise_std", 0.01))
@@ -299,6 +483,7 @@ class IronCellModel(PreTrainedModel):
             hidden_size=gen_h,
             num_heads=num_heads,
             num_queries=num_queries,
+            query_group_size=query_group_size,
             ln_in_enabled=ln_in_enabled,
             ln_out_enabled=ln_out_enabled,
             init_noise_std=init_noise_std,
@@ -313,6 +498,11 @@ class IronCellModel(PreTrainedModel):
         else:
             self.special_token_embeddings = nn.Embedding(0, gen_h).to(dtype=gen_dtype)
         self.special_token_embeddings.weight.requires_grad = False
+
+        # for layer in self.generator.model.layers:
+        #     layer.self_attn.javis_gate = nn.Parameter(
+        #         torch.tensor([0.1], dtype=self.generator.dtype, device=self.generator.device)
+        #     )
 
         if config.freeze_compressor:
             for p in self.compressor.parameters():
@@ -461,13 +651,12 @@ class IronCellModel(PreTrainedModel):
             javis_metrics = None
 
         # ==========================================
-        # 🔥 获取 32 层 Deep KV (核心改动)
+        # 🔥 获取 32 层 Deep KV (不需要改，里面已经适配了 G 维度)
         # ==========================================
         layer_kvs = self.javis.get_all_layer_kv(javis_out_flat) 
         # layer_kvs: 32 elements of (K, V)
         # K/V shape: [B*C, num_kv_heads, Q, head_dim]
         
-        # 将 flat 的 K/V reshape 回 [B, C, ... ] 以便后续切片覆写
         reshaped_layer_kvs = []
         for l in range(self.javis.num_layers):
             k_flat, v_flat = layer_kvs[l]
@@ -475,9 +664,17 @@ class IronCellModel(PreTrainedModel):
             v_res = v_flat.view(bsz, num_chunks, self.javis.num_kv_heads, self.javis.num_queries, self.javis.head_dim)
             reshaped_layer_kvs.append((k_res, v_res))
 
-        javis_vecs = javis_out_flat.view(bsz, num_chunks, self.javis.num_queries, -1)
+        # ==========================================
+        # 🚀 核心适配：处理 Layer 0 拼接用的 memory_vectors (javis_vecs)
+        # ==========================================
+        # javis_out_flat 的 shape 是 [B*C, G, Q, H]
+        # Layer 0 最需要的是 Group 0 (负责最浅层) 的语义
+        javis_out_group0 = javis_out_flat[:, 0, :, :] # 取出 Group 0, shape: [B*C, Q, H]
+        
+        # 将 Group 0 的特征 view 回 [B, C, Q, H] 给 inputs_embeds 用
+        javis_vecs = javis_out_group0.view(bsz, num_chunks, self.javis.num_queries, -1)
 
-        # 统一返回 Deep KV
+        # 统一返回 Deep KV (依然传出完整的 javis_out_flat 供挂探针用)
         if return_metrics:
             return javis_out_flat, javis_vecs, reshaped_layer_kvs, javis_metrics, current_out_cos
         return javis_out_flat, javis_vecs, reshaped_layer_kvs, current_out_cos

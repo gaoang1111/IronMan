@@ -27,6 +27,7 @@ class IronCellConfig(PretrainedConfig):
         freeze_compressor: bool = True,
         javis_num_heads: int = 16,
         javis_num_queries: int = 1,
+        javis_query_group_size: int = 1,
         javis_ln_in: bool = True,
         javis_ln_out: bool = True,
         javis_init_noise_std: float = 0.01,
@@ -55,6 +56,8 @@ class IronCellConfig(PretrainedConfig):
         self.freeze_compressor = bool(freeze_compressor)
         self.javis_num_heads = int(javis_num_heads)
         self.javis_num_queries = int(javis_num_queries)
+        self.javis_query_group_size = int(javis_query_group_size)
+
         self.javis_ln_in = bool(javis_ln_in)
         self.javis_ln_out = bool(javis_ln_out)
         self.javis_init_noise_std = float(javis_init_noise_std)

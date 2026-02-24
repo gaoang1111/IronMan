@@ -177,85 +177,6 @@ class TrainStepModuleForFullLayersKVInjection(nn.Module):
                 self.grad_probe_sums[name] = val
         tensor.register_hook(_hook)
 
-    def _forward(self, batch, *, return_metrics: bool = False):  # type: ignore[override]
-        device = self.iron.device
-        # 判断是否开启特征蒸馏
-        distill_on = (
-            self.distill_coeff != 0.0
-            and hasattr(batch, "teacher_hidden_targets")
-            and batch.teacher_hidden_targets.numel() > 0
-            and hasattr(batch, "valid_v_lens")
-            and batch.valid_v_lens.numel() > 0
-            and int(batch.valid_v_lens.max().item()) > 0
-        )
-        
-        chunk_ids = batch.chunk_input_ids.to(device)
-        chunk_mask = batch.chunk_attention_mask.to(device)
-        zipper_ids = batch.zipper_input_ids.to(device)
-        mem_pos = batch.memory_positions.to(device)
-        attn_2d = batch.attention_mask_2d.to(device)
-        position_ids = batch.position_ids.to(device)
-        labels = batch.labels.to(device)
-
-        # 1. 过 Javis 提取 V
-        memory_out = self.iron.compute_compressed_vectors(
-            chunk_input_ids=chunk_ids,
-            chunk_attention_mask=chunk_mask,
-            return_metrics=return_metrics,
-        )
-        javis_metrics = None
-            
-        if return_metrics:
-            memory_vectors, deep_layer_kvs, javis_metrics, current_out_cos = memory_out
-        else:
-            memory_vectors, deep_layer_kvs, current_out_cos = memory_out
-        self._register_grad_probe("memory_vectors", memory_vectors)
-
-
-        memory_vectors_det = memory_vectors.detach().requires_grad_(True)
-        
-        # 🚀 2. 统一变量名：只存这一对，不要用什么 _orig_tensors 列表！
-        self._orig_mem_vecs = memory_vectors
-        self._det_mem_vecs = memory_vectors_det
-
-        # 挂载隔离后的数据（Generator 只允许接触隔离层）
-        DEEP_KV_CONTEXT["memory_vectors"] = memory_vectors_det 
-        DEEP_KV_CONTEXT["javis_module"] = self.iron.javis
-        DEEP_KV_CONTEXT["memory_positions"] = mem_pos
-        DEEP_KV_CONTEXT["num_queries"] = self.iron.javis.num_queries
-
-        # 🚀 3. 这里的 inputs_embeds 必须用隔离后的版本！
-        inputs_embeds = self.iron.build_inputs_embeds(
-            zipper_input_ids=zipper_ids,
-            memory_vectors=memory_vectors_det, # 使用 det 版
-            memory_positions=mem_pos,
-        )
-        self._register_grad_probe("inputs_embeds", inputs_embeds)
-
-        out = self.iron(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attn_2d,
-                position_ids=position_ids,
-                labels=labels,
-                use_cache=False,
-            )
-        
-
-        gen_loss = out.loss
-        
-        # l2_loss = memory_vectors.norm(p=2, dim=-1).mean() if self.phase == "phase2" else torch.zeros_like(gen_loss)
-        l2_loss = (
-            memory_vectors.norm(p=2, dim=-1).mean() 
-            if self.phase == "phase2" 
-            else torch.tensor(0.0, device=gen_loss.device, dtype=gen_loss.dtype)
-        )
-        ortho_penalty = torch.relu(current_out_cos.to(gen_loss.dtype) - 0.1)
-        self._extra_loss = (self.l2_coeff * l2_loss) + (self.javis_q_cos_coeff * ortho_penalty)
-
-        if return_metrics:
-            return gen_loss, l2_loss.detach(), javis_metrics, current_out_cos.detach()
-        return gen_loss, l2_loss.detach(), current_out_cos.detach()
-
 
     def forward(self, batch, *, return_metrics: bool = False):  # type: ignore[override]
         device = self.iron.device
@@ -341,8 +262,20 @@ class TrainStepModuleForFullLayersKVInjection(nn.Module):
             if self.phase == "phase2" 
             else torch.tensor(0.0, device=gen_loss.device, dtype=gen_loss.dtype)
         )
-        ortho_penalty = torch.relu(current_out_cos.to(gen_loss.dtype) - 0.1)
+        # ortho_penalty = torch.relu(current_out_cos.to(gen_loss.dtype) - 0.1)
         
+        q_params = self.iron.javis.q  # shape: [G, Q, H], 例如 [8, 2, 4096]
+        if q_params.size(1) >= 2:
+            # 计算每组内 Q0 和 Q1 的余弦相似度
+            q_cos = F.cosine_similarity(q_params[:, 0, :], q_params[:, 1, :], dim=-1)
+            # 取所有组的平均值
+            mean_q_cos = q_cos.mean()
+            # 惩罚项：如果余弦相似度大于 0.1，则施加惩罚
+            ortho_penalty = torch.relu(mean_q_cos.to(gen_loss.dtype) - 0.1)
+        else:
+            ortho_penalty = torch.tensor(0.0, device=gen_loss.device, dtype=gen_loss.dtype)
+            mean_q_cos = torch.tensor(0.0)
+            
         # 存在抽屉里，一会儿和代理 Loss 一起引爆
         self._extra_loss = (self.l2_coeff * l2_loss) + (self.javis_q_cos_coeff * ortho_penalty)
 
