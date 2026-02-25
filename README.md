@@ -72,8 +72,6 @@ This architecture proves that clones of the exact same homologous pre-trained mo
 1. Clone the repository: 
 ```bash
 git clone https://github.com/gaoang1111/IronMan.git
-git fetch origin ga/Mark-42
-git checkout ga/Mark-42
 ```
 2. Download the Mark-42 model checkpoint: 
 ```bash
