@@ -92,10 +92,10 @@ huggingface-cli download ddddamn/IronCell-Mark-42 --include "phase-full/*" --loc
 
 
 Citation
-If you find IronCell Mark 1 helpful in your research or applications, please cite it using the following format:
+If you find IronCell Mark 42 helpful in your research or applications, please cite it using the following format:
 
 @misc{ironcell2026,
-  title={IronCell Mark 1: 16:1 Full Sequence Compression via Homologous Model Differentiation},
+  title={IronCell Mark-42: 16:2 Context Compression via Homologous Model Differentiation},
   author={gaoang1111},
   year={2026},
   publisher={GitHub},
