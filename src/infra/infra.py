@@ -60,6 +60,10 @@ def _mark42_llama_attention_forward(
     key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
+    if getattr(self, "layer_idx", -1) == 0:
+        if past_key_values is not None:
+            current_cache_len = past_key_values.get_seq_length()
+            print(f"🔍 [Engine Monitor] Input Query Length: {q_len} | Current KV Cache Length: {current_cache_len}")
     if javis_all_layer_kvs is not None and javis_meta is not None:
         target_layers = getattr(self, "_mark42_target_layers", None)
         if target_layers is None or int(getattr(self, "layer_idx", -1)) in target_layers:
@@ -285,16 +289,25 @@ class Mark42StreamingEngine:
     def _prefill_suffix(self, raw_queue: list[int], mem_cache, embed_dtype: torch.dtype):
         suffix_ids = torch.tensor([[self.eoc_id] + [int(x) for x in raw_queue]], device=self.device, dtype=torch.long)
         suffix_embeds = _embed_with_special_overrides(self.model, suffix_ids).to(dtype=embed_dtype)
+        
+        working_cache = self._clone_cache(mem_cache)
+        
         with torch.inference_mode():
-            out = self.model.generator(inputs_embeds=suffix_embeds, past_key_values=mem_cache, use_cache=True)
+            out = self.model.generator(inputs_embeds=suffix_embeds, past_key_values=working_cache, use_cache=True)
         return out.past_key_values, out.logits[:, -1, :]
 
-    # def _sample_next_token(self, logits: torch.Tensor, *, temperature: float, repetition_penalty: float) -> int:
-    #     if float(temperature) > 0.0:
-    #         probs = F.softmax(logits / float(temperature), dim=-1)
-    #         return int(torch.multinomial(probs, num_samples=1).item())
-    #     return int(torch.argmax(logits, dim=-1).item())
-
+    def _clone_cache(self, cache):
+        if cache is None:
+            return None
+        if isinstance(cache, tuple):
+            return tuple(tuple(t.clone() for t in layer) for layer in cache)
+        
+        # 兼容最新版 transformers 的 DynamicCache
+        from transformers.cache_utils import DynamicCache
+        legacy = cache.to_legacy_cache()
+        cloned_legacy = tuple(tuple(t.clone() for t in layer) for layer in legacy)
+        return DynamicCache.from_legacy_cache(cloned_legacy)
+    
     def _sample_next_token(
         self, 
         logits: torch.Tensor, 
