@@ -112,10 +112,12 @@ class Javis(nn.Module):
                 nn.LayerNorm(self.hidden_size, dtype=dtype) for _ in range(self.num_query_group)
             ])
         
-        # self.q = nn.Parameter(torch.empty((self.num_queries, self.hidden_size), dtype=dtype))
-        self.q = nn.Parameter(torch.empty((self.num_query_group, num_queries, hidden_size), dtype=dtype))
+        # self.q_base = nn.Parameter(torch.empty((self.num_queries, self.hidden_size), dtype=dtype))
+        self.q_base = nn.Parameter(torch.empty((self.num_query_group, num_queries, hidden_size), dtype=dtype))
+        # self.q_proj = nn.Linear(hidden_size, num_queries * hidden_size).to(dtype=dtype)
+        self.q_ln = nn.LayerNorm(hidden_size, dtype=dtype)
 
-        nn.init.normal_(self.q, mean=0.0, std=1.0)
+        nn.init.normal_(self.q_base, mean=0.0, std=1.0)
 
         self.wk = nn.Linear(self.hidden_size, self.hidden_size, bias=False).to(dtype=dtype)
         self.wv = nn.Linear(self.hidden_size, self.hidden_size, bias=False).to(dtype=dtype)
@@ -219,10 +221,14 @@ class Javis(nn.Module):
         B = int(x.size(0))
         G = self.num_query_group
         Q_len = self.num_queries
+        H = self.hidden_size
         seq_len = int(k_full.size(1))
         
         # q_tensor: [B, G, Q, H]
-        q_tensor = self.q.unsqueeze(0).expand(B, -1, -1, -1)
+        chunk_mean = x.mean(dim=1)
+        delta_q = self.q_proj(chunk_mean) 
+        delta_q = delta_q.view(B, self.num_queries, H).unsqueeze(1)
+        q_tensor = self.q_base.unsqueeze(0).expand(B, -1, -1, -1) + delta_q
         
         # --- 注册 Hook 监控正交度 ---
         if self.training and return_metrics and q_tensor.requires_grad:
@@ -236,9 +242,7 @@ class Javis(nn.Module):
         h_heads = self.num_heads
         d_k = self.hidden_size // h_heads
 
-        # ==========================================
-        # 🚀 绝杀显存：原生高维广播，彻底消灭 reshape 复制
-        # ==========================================
+        
         # q: [B, G, Q, h, d] -> [B, G, h, Q, d]
         q = q_tensor.view(B, G, Q_len, h_heads, d_k).transpose(2, 3)
         
@@ -319,86 +323,7 @@ class Javis(nn.Module):
 
 
 
-    def _forward(
-        self,
-        hidden: torch.Tensor,
-        *,
-        attention_mask: torch.Tensor | None = None,
-        return_metrics: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, dict[str, float], torch.Tensor]:
-        x = self.pre_kv_hidden(hidden)
-
-        k = self.wk(x)
-        v = self.wv(x)
-
-        n = int(x.size(0))
-        q_tensor = self.q.unsqueeze(0).expand(n, -1, -1)
-        if self.training and return_metrics and q_tensor.requires_grad:
-            def _q_grad_hook(grad: torch.Tensor) -> None:
-                grad_q0 = grad[:, 0, :].float()
-                grad_q1 = grad[:, 1, :].float()
-                cos_sim = F.cosine_similarity(grad_q0, grad_q1, dim=-1, eps=1e-8).mean()
-                self.current_q_grad_cos = float(cos_sim.item())
-            q_tensor.register_hook(_q_grad_hook)
-        q = q_tensor
-
-        q_len = int(q.size(1))
-        seq_len = int(k.size(1))
-        h = self.num_heads
-        d_k = self.hidden_size // h
-
-        q = q.view(n, q_len, h, d_k).transpose(1, 2)  # [N,h,Q,d]
-        k = k.view(n, seq_len, h, d_k).transpose(1, 2)  # [N,h,L,d]
-        v = v.view(n, seq_len, h, d_k).transpose(1, 2)  # [N,h,L,d]
-
-        logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k)  # [N,h,Q,L]
-        if attention_mask is not None:
-            m = attention_mask.to(dtype=torch.bool, device=logits.device).view(n, 1, 1, seq_len)
-            logits = logits.masked_fill(~m, torch.finfo(logits.dtype).min)
-
-        attn = torch.softmax(logits.float(), dim=-1).to(dtype=logits.dtype)
-        ctx = torch.matmul(attn, v)  # [N,h,Q,d]
-        ctx = ctx.transpose(1, 2).contiguous().view(n, q_len, self.hidden_size)  # [N,Q,H]
-        
-        out = self.wo(ctx)
-        if self.ln_out_enabled:
-            out = self.ln_out(out)
-        assert out.dim() == 3 and out.size(1) == self.num_queries
-        current_out_cos = torch.zeros((), device=out.device, dtype=out.dtype)
-        if out.size(1) >= 2:
-            current_out_cos = F.cosine_similarity(out[:, 0, :], out[:, 1, :], dim=-1, eps=1e-8).mean()
-
-        # B, S, D = hidden.shape
-        # shortcut = hidden.view(B, self.num_queries, S // self.num_queries, D).mean(dim=2)
-        
-        # return out + shortcut
-
-        global_mean = hidden.mean(dim=1, keepdim=True) # [B, 1, D]
-        shortcut = global_mean.expand(-1, self.num_queries, -1) # [B, 2, D]
-        metrics: dict[str, float] | None = None
-        if return_metrics:
-            metrics = {}
-            with torch.no_grad():
-                out_detached = out.detach().float()
-                mean_detached = global_mean.detach().float()
-                out_pair = out_detached[:, :2, :]
-                norm_out = out_pair.norm(p=2, dim=-1).mean()
-                norm_mean = mean_detached.norm(p=2, dim=-1).mean()
-                metrics["javis_norm_ratio"] = float((norm_out / (norm_mean + 1e-9)).item())
-                metrics["javis_out_cos"] = float(current_out_cos.detach().item())
-                token_len = min(16, seq_len)
-                if token_len > 0 and out_pair.size(1) >= 2:
-                    attn_detached = attn.detach().float()
-                    attn_q0 = attn_detached[:, :, 0, :token_len].mean(dim=1)
-                    attn_q1 = attn_detached[:, :, 1, :token_len].mean(dim=1)
-                    kl_div = F.kl_div((attn_q1 + 1e-9).log(), attn_q0, reduction="batchmean")
-                    metrics["javis_attn_kl"] = float(kl_div.item())
-
-        final_out = out + shortcut*0.5
-        if return_metrics:
-            return final_out, metrics, current_out_cos
-        return final_out, current_out_cos
-
+    
     def _get_all_layer_kv(self, v_out: torch.Tensor) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
         """
         Transforms the Javis 2-token output into LLaMA-3.1 strict past_key_values format.

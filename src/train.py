@@ -119,7 +119,7 @@ def set_phase(model: IronCellModel, phase: str) -> None:
                 p.requires_grad = True
         if hasattr(model, "javis"):
             model.javis.layer_gates.requires_grad = False
-            # model.javis.layer_gates.data.fill_(0.07)
+            model.javis.layer_gates.data.fill_(0.07)
     elif phase == "phase2":
         model.config.freeze_compressor = False
         # 全量解冻
@@ -181,6 +181,12 @@ def main() -> None:
             tags = [t.strip() for t in str(args.wandb_run_tags).split(",") if t.strip()]
         wandb.init(project=str(args.wandb_project), name=run_name, tags=tags, config=args)
     
+    tokenizer, is_resume = load_tokenizer(args)
+    model = load_model(args, tokenizer, device, is_resume=is_resume)
+
+    # 3. 优化设置
+    model.generator.config.use_cache = False
+
     # # 3. 优化设置
     # model.generator.config.use_cache = False
     # model.generator.gradient_checkpointing_enable()
@@ -297,7 +303,8 @@ def main() -> None:
                 collate_fn=collator_eval,
             )
 
-    if args.phase == "phase1" and not is_resume:
+    if 0:
+    # if args.phase == "phase1" and not is_resume:
         warmup_init_javis_query(
             model,
             loader,
@@ -526,8 +533,8 @@ def main() -> None:
                     break
 
             javis_grad_norm = torch.zeros((), device=device)
-            if iron.javis.q.grad is not None:
-                javis_grad_norm = (iron.javis.q.grad.float() ** 2).sum()
+            if iron.javis.q_base.grad is not None:
+                javis_grad_norm = (iron.javis.q_base.grad.float() ** 2).sum()
 
             cmp_grad_norm = torch.zeros((), device=device)
             for name, p in iron.compressor.named_parameters():
