@@ -114,7 +114,7 @@ class Javis(nn.Module):
         
         # self.q_base = nn.Parameter(torch.empty((self.num_queries, self.hidden_size), dtype=dtype))
         self.q_base = nn.Parameter(torch.empty((self.num_query_group, num_queries, hidden_size), dtype=dtype))
-        # self.q_proj = nn.Linear(hidden_size, num_queries * hidden_size).to(dtype=dtype)
+        self.q_proj = nn.Linear(hidden_size, num_queries * hidden_size).to(dtype=dtype)
         self.q_ln = nn.LayerNorm(hidden_size, dtype=dtype)
 
         nn.init.normal_(self.q_base, mean=0.0, std=1.0)
