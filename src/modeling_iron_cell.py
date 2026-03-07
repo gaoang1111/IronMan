@@ -115,6 +115,7 @@ class Javis(nn.Module):
         # self.q_base = nn.Parameter(torch.empty((self.num_queries, self.hidden_size), dtype=dtype))
         self.q_base = nn.Parameter(torch.empty((self.num_query_group, num_queries, hidden_size), dtype=dtype))
         self.q_proj = nn.Linear(hidden_size, num_queries * hidden_size).to(dtype=dtype)
+        self.alpha = 1.0
         self.q_ln = nn.LayerNorm(hidden_size, dtype=dtype)
 
         nn.init.normal_(self.q_base, mean=0.0, std=1.0)
@@ -228,7 +229,8 @@ class Javis(nn.Module):
         chunk_mean = x.mean(dim=1)
         delta_q = self.q_proj(chunk_mean) 
         delta_q = delta_q.view(B, self.num_queries, H).unsqueeze(1)
-        q_tensor = self.q_base.unsqueeze(0).expand(B, -1, -1, -1) + delta_q
+        q_tensor = self.q_base.unsqueeze(0).expand(B, -1, -1, -1) + delta_q * self.alpha
+        # print(f" {delta_q.norm(dim=-1).mean().item()=} {delta_q.size()=}  {self.q_base.norm(dim=-1).mean().item()=}  {self.q_base.size()=} ")
         
         # --- 注册 Hook 监控正交度 ---
         if self.training and return_metrics and q_tensor.requires_grad:
