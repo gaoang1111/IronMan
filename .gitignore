@@ -1,7 +1,10 @@
 
 *.pyc
 
-
+*.json
+*.png
+*.jsonl
+*.csv
 __pycache__/
 
 wandb/
