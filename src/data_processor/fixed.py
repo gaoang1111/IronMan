@@ -65,38 +65,23 @@ def build_zipper_mask_posid(
     buffer_size: int = 0,
     num_v: int = 1,
 ) -> tuple[torch.BoolTensor, torch.LongTensor]:
-    
-    # ==========================================
-    # 1. 统一逻辑：Raw 段数 = Control 组数
-    # ==========================================
-    # 如果有 leftover，它就是第 N+1 个段
     num_raw_segments = num_chunks + (1 if left_over > 0 else 0)
     num_control_groups = num_raw_segments
-    
-    # 计算 Prefix 长度
-    # Prefix: BOS + SOC + (v + EOC) * num_control_groups
-    # 这里的 num_control_groups 包含了初始组 (-1 组) 到 倒数第二组
-    # 刚好对应每一个 Raw Segment
+
     prefix_len = 1 + 1 + (num_v + 1) * num_control_groups
-    
+
     raw_phys_start = prefix_len
-    
-    # 校验长度 (非常重要，防止 Input 拼错了但 Mask 没报错)
+
     expected_valid_len = prefix_len + num_chunks * chunk_size + left_over
-    assert valid_len == expected_valid_len, \
+    assert valid_len == expected_valid_len, (
         f"Geometry mismatch! Valid:{valid_len} vs Calc:{expected_valid_len}. Check Input Assembly."
+    )
 
     mask = torch.zeros((seq_len, seq_len), dtype=torch.bool, device=device)
-    
-    # ==========================================
-    # 2. Prefix 内部逻辑 (Control Chain)
-    # ==========================================
-    
-    # 2.1 BOS & SOC
-    mask[0, 0] = True      # BOS 看 BOS
-    mask[1, :2] = True     # SOC 看 BOS, SOC
-    
-    # 2.2 v 和 EOC (因果链)
+
+    mask[0, 0] = True
+    mask[1, :2] = True
+
     all_v_indices: list[int] = []
     for k in range(num_control_groups):
         group_base = 2 + (num_v + 1) * k
@@ -114,71 +99,43 @@ def build_zipper_mask_posid(
         if all_v_indices:
             mask[eoc_idx, torch.tensor(all_v_indices, device=device)] = True
         mask[eoc_idx, eoc_idx] = True
-    
-    # ==========================================
-    # 3. Raw Chunk 逻辑 (Hybrid Attention)
-    # ==========================================
-    
+
     for i in range(num_raw_segments):
-        # 计算当前 Raw Chunk 的物理范围
         c_start = raw_phys_start + i * chunk_size
         c_end = min(c_start + chunk_size, valid_len)
-        
-        # 实际长度 (最后一段可能是 leftover)
-        c_len = c_end - c_start
-        if c_len <= 0: continue # 防御性代码
 
-        # A. Chunk 内部自回归 (Autoregressive)
+        c_len = c_end - c_start
+        if c_len <= 0:
+            continue
+
         chunk_causal = torch.tril(torch.ones((c_len, c_len), dtype=torch.bool, device=device))
         mask[c_start:c_end, c_start:c_end] = chunk_causal
-        
-        # B. 历史判定 (Split Logic)
-        # split_idx 表示从哪里开始是 Buffer (保留高清原图)
-        # 比 split_idx 小的都是 Compressed (只看 v)
+
+        mask[c_start:c_end, :2] = True
+        mask[c_start:c_end, 2 : 2 + num_v] = True
+
         split_idx = i - buffer_size
-        
-        # --- 压缩部分 (Compressed History) ---
-        if split_idx >= 0:
-            # 1. BOS, SOC
-            mask[c_start:c_end, :2] = True
-            
-            # 2. v 序列 (直到 split_idx)
-            # 注意：如果 Raw_i 是 Compressed，那么 Raw_i 对应的 v_i 就是 summary。
-            # 当前 chunk 应该看之前的 chunks 对应的 v。
-            # 第 k 个 chunk 对应的 v 是 Group k-1 (如果 Group -1 算 0 号的话...)
-            # 让我们理一下索引：
-            # Raw 0 看 v_-1 (Group 0)
-            # Raw 1 看 v_-1, v_0 (Group 0, 1)
-            # 所以 Raw i 应该看 Group 0 到 Group i (inclusive, 因为 v_i 还没生成呢? 不，v_i 是 Raw i 的总结)
-            # 正确逻辑: Raw i 只能看 Raw 0..i-1 的总结。
-            # Raw 0 对应的总结是 v_0 (在 Group 1, Idx 4)。
-            # 初始状态是 v_-1 (在 Group 0, Idx 2)。
-            
-            # 这里的 split_idx 是 chunk index。
-            # 我们需要看到 Group 0 到 Group split_idx 的 v。
+
+        if split_idx > 0:
             limit_idx = split_idx
             group_bases = 2 + (num_v + 1) * torch.arange(limit_idx + 1, device=device)
             v_offsets = torch.arange(num_v, device=device)
             v_indices = (group_bases.unsqueeze(1) + v_offsets.unsqueeze(0)).reshape(-1)
             mask[c_start:c_end, v_indices] = True
-            
-            # 3. Trigger EOC (仅最后一个被压缩块的 EOC，作为桥梁)
-            # 也就是 Group split_idx 的 EOC
+
             last_eoc_idx = 2 + (num_v + 1) * limit_idx + num_v
             mask[c_start:c_end, last_eoc_idx] = True
-            
-        # --- 缓冲部分 (Buffered History) ---
+        else:
+            mask[c_start:c_end, 2 + num_v] = True
+
         start_buffer_idx = max(0, split_idx)
         for j in range(start_buffer_idx, i):
             prev_c_start = raw_phys_start + j * chunk_size
             prev_c_end = min(prev_c_start + chunk_size, valid_len)
-            
+
             if prev_c_end > prev_c_start:
                 mask[c_start:c_end, prev_c_start:prev_c_end] = True
 
-    # ==========================
-    # 4. RoPE IDs
-    # ==========================
     pos_ids = mask.long().sum(dim=-1) - 1
     pos_ids = pos_ids.clamp(min=0)
 
@@ -212,14 +169,13 @@ def build_zipper_labels(
     labels = torch.full_like(input_ids, ignore_index)
 
     import random
+
     if random.random() < random_gate:
-        visible_len = 3
+        visible_len = 14
     else:
         visible_len = chunk_size
     for k in range(num_raw_segments):
         curr_start = raw_phys_start + k * chunk_size
-        # curr_end = min(curr_start + chunk_size, valid_len)
-
         curr_end = min(curr_start + chunk_size, valid_len, curr_start + visible_len)
         chunk_len = curr_end - curr_start
 
@@ -313,12 +269,8 @@ class ZipperBuilder:
 
         self.gen_input_ids = self.prefix_ids + self.raw_core_ids
         self.valid_len = len(self.gen_input_ids)
-        
-        # WARNING: This assumes prefix is exactly [BOS, SOC] (len 2). 
-        # k starts from 1 to skip v_-1 (at index 2), aligning with CMP outputs (v_0, v_1...).
-        self.memory_positions = [
-            2 + (self.num_v + 1) * k for k in range(1, self.num_cmp_chunks + 1)
-        ]
+
+        self.memory_positions = [2 + (self.num_v + 1) * k for k in range(1, self.num_cmp_chunks + 1)]
 
     def build_gen_labels(self, device: torch.device) -> torch.LongTensor:
         input_ids_t = torch.tensor(self.gen_input_ids, dtype=torch.long, device=device)
@@ -346,15 +298,8 @@ class ZipperBuilder:
             num_v=self.num_v,
         )
 
+
 class IronCellCollator:
-    """
-    Build zipper layout + staircase mask for Iron-Cell masked parallel training.
-
-    This collator is intentionally "heavy": it performs tokenization, chunking,
-    zipper construction, attention-mask construction, and label construction.
-    The model itself only receives embeddings + attention mask.
-    """
-
     def __init__(
         self,
         tokenizer: PreTrainedTokenizerBase,
@@ -387,7 +332,11 @@ class IronCellCollator:
             raise ValueError("Empty batch")
 
         device = torch.device("cpu")
-        pad_id = int(self.tokenizer.pad_token_id) if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+        pad_id = (
+            int(self.tokenizer.pad_token_id)
+            if self.tokenizer.pad_token_id is not None
+            else self.tokenizer.eos_token_id
+        )
         if isinstance(items[0], tuple):
             texts, idxs = zip(*items)
             idxs_t = torch.tensor(idxs, dtype=torch.long, device=device)
@@ -488,7 +437,6 @@ class IronCellCollator:
             attention_mask_2d[b] = attn
             position_ids[b] = pos_ids
 
-
         return ZipperBatch(
             zipper_input_ids=zipper_input_ids,
             labels=labels,
@@ -504,3 +452,4 @@ class IronCellCollator:
             valid_v_lens=valid_v_lens,
             teacher_hidden_target_layer=teacher_hidden_target_layer,
         )
+

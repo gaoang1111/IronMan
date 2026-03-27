@@ -365,15 +365,15 @@ def warmup_init_javis_query(
         if use_dist and torch.distributed.is_initialized():
             torch.distributed.broadcast(q_groups, src=0)
             
-        # 🚀 3. 赋值给 3D 的 self.q
-        model.javis.q.copy_(q_groups.to(dtype=model.javis.q.dtype))
+        # 🚀 3. 赋值给 3D 的 self.q_base
+        model.javis.q_base.copy_(q_groups.to(dtype=model.javis.q_base.dtype))
 
     print(f"init q now {num_samples} num_groups={num_query_group} {num_queries=} {torch.distributed.is_initialized()=} \n" + "="*50)
     
     if not use_dist or (torch.distributed.is_initialized() and torch.distributed.get_rank() == 0):
         import sys
         with torch.no_grad():
-            q_final = model.javis.q.detach().float()
+            q_final = model.javis.q_base.detach().float()
             if num_queries > 1:
                 # 🚀 提取 Group 0 的矩阵做代表性诊断
                 q_g0 = q_final[0] 
@@ -401,7 +401,7 @@ def warmup_init_javis_query(
                 out_path = Path(os.getcwd()) / out_path
             out_path.parent.mkdir(parents=True, exist_ok=True)
             # q_init 保存的就是 3D 张量了
-            torch.save({"hidden": data, "mean": mean.cpu(), "std": std.cpu(), "q_init": model.javis.q.detach().cpu()}, out_path)
+            torch.save({"hidden": data, "mean": mean.cpu(), "std": std.cpu(), "q_init": model.javis.q_base.detach().cpu()}, out_path)
 
     if model_was_training:
         model.train()
@@ -498,14 +498,14 @@ def _warmup_init_javis_query(
 
         if use_dist and torch.distributed.is_initialized():
             torch.distributed.broadcast(q, src=0)
-        model.javis.q.copy_(q.to(dtype=model.javis.q.dtype))
+        model.javis.q_base.copy_(q.to(dtype=model.javis.q_base.dtype))
 
     print(f"init q now {num_samples} {num_queries=}  {torch.distributed.is_initialized()=}  {torch.distributed.get_rank()=} \n" + "="*50)
     
     if not use_dist or (torch.distributed.is_initialized() and torch.distributed.get_rank() == 0):
         import sys
         with torch.no_grad():
-            q_final = model.javis.q.detach().float()
+            q_final = model.javis.q_base.detach().float()
             if num_queries > 1:
                 # 计算余弦相似度矩阵
                 norm_q = q_final / (q_final.norm(dim=1, keepdim=True) + 1e-8)
@@ -533,7 +533,7 @@ def _warmup_init_javis_query(
             if not out_path.is_absolute():
                 out_path = Path(os.getcwd()) / out_path
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({"hidden": data, "mean": mean.cpu(), "std": std.cpu(), "q_init": model.javis.q.detach().cpu()}, out_path)
+            torch.save({"hidden": data, "mean": mean.cpu(), "std": std.cpu(), "q_init": model.javis.q_base.detach().cpu()}, out_path)
 
     if model_was_training:
         model.train()

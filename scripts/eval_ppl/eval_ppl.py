@@ -13,7 +13,7 @@ os.sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data_processor import IronCellCollator
 from src.data_processor import AdaptiveIronCellCollator
-from src.train_utils import _build_fsdp_auto_wrap_policy
+from src.hack_llama_ddp import TrainStepModuleForFullLayersKVInjection as TrainStepModule
 from src.train_utils import JsonlDataset, load_model, load_tokenizer
 
 
@@ -66,44 +66,19 @@ def main() -> None:
     p.add_argument("--chunk_size", type=int, default=16)
     p.add_argument("--chunking", type=str, default="fixed", choices=["fixed", "adaptive"])
     p.add_argument("--max_batches", type=int, default=0)
-    p.add_argument("--truncate_len", type=int, default=0)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
-    p.add_argument("--parallel", type=str, default="none", choices=["none", "ddp", "fsdp"])
-    p.add_argument("--fsdp_wrap", type=str, default="generator_only", choices=["generator_only", "full"])
-    p.add_argument("--fsdp_cpu_offload", type=int, default=0, choices=[0, 1])
-    p.add_argument("--fsdp_use_orig_params", type=int, default=1, choices=[0, 1])
-    p.add_argument("--fsdp_sync_module_states", type=int, default=0, choices=[0, 1])
     args = p.parse_args()
 
-    did_init_pg = False
-    parallel = str(args.parallel).lower()
-    use_ddp = parallel == "ddp"
-    use_fsdp = parallel == "fsdp"
-    use_dist = use_ddp or use_fsdp
-
-    if use_dist:
-        if args.device != "auto":
-            raise ValueError("--parallel ddp/fsdp requires --device auto.")
-        if not torch.distributed.is_available():
-            raise RuntimeError("torch.distributed is not available.")
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        if not torch.cuda.is_available():
-            raise RuntimeError("Distributed eval requires CUDA.")
-        torch.cuda.set_device(local_rank)
-        torch.distributed.init_process_group(backend="nccl")
-        did_init_pg = True
-        device = torch.device("cuda", local_rank)
-        rank0 = int(torch.distributed.get_rank()) == 0
+    if args.device == "cuda":
+        device = torch.device("cuda")
+    elif args.device == "cpu":
+        device = torch.device("cpu")
     else:
-        if args.device == "cuda":
-            device = torch.device("cuda")
-        elif args.device == "cpu":
-            device = torch.device("cpu")
-        else:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        rank0 = True
-        if _is_dist():
-            rank0 = int(os.environ.get("RANK", "0")) == 0
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    rank0 = True
+    if _is_dist():
+        rank0 = int(os.environ.get("RANK", "0")) == 0
 
     run_args = _Args(
         model_name="",
@@ -117,58 +92,21 @@ def main() -> None:
     model = load_model(run_args, tokenizer, device, is_resume=is_resume)
     model.eval()
 
-    if use_fsdp:
-        from torch.distributed.fsdp import (
-            CPUOffload,
-            FullyShardedDataParallel as FSDP,
-            MixedPrecision,
-            ShardingStrategy,
-        )
-
     if str(args.chunking) == "adaptive":
         dataset = _JsonlDatasetWithChunkLens(str(args.data_path))
-        collator = AdaptiveIronCellCollator(tokenizer, truncate_len=None if int(args.truncate_len) <= 0 else int(args.truncate_len))
+        collator = AdaptiveIronCellCollator(tokenizer)
     else:
         dataset = JsonlDataset(str(args.data_path))
-        collator = IronCellCollator(
-            tokenizer,
-            num_v=2,
-            random_gate=0,
-            chunk_size=int(args.chunk_size),
-            truncate_len=None if int(args.truncate_len) <= 0 else int(args.truncate_len),
-        )
-    sampler = None
-    if _is_dist():
-        sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=False)
+        collator = IronCellCollator(tokenizer, chunk_size=int(args.chunk_size))
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=int(args.batch_size),
         shuffle=False,
-        sampler=sampler,
         num_workers=0,
         collate_fn=collator,
     )
 
-    if use_fsdp:
-        from src.hack_llama_fsdp import TrainStepModuleForFullLayersKVInjection as TrainStepModule
-    else:
-        from src.hack_llama_ddp import TrainStepModuleForFullLayersKVInjection as TrainStepModule
     step_module = TrainStepModule(model, phase=str(args.phase))
-    step_module.to(torch.bfloat16)
-    if use_fsdp:
-        mp = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16)
-        cpu_offload = CPUOffload(offload_params=True) if int(args.fsdp_cpu_offload) == 1 else None
-        auto_wrap_policy = _build_fsdp_auto_wrap_policy(model, str(args.fsdp_wrap))
-        step_module = FSDP(
-            step_module,
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
-            auto_wrap_policy=auto_wrap_policy,
-            mixed_precision=mp,
-            cpu_offload=cpu_offload,
-            use_orig_params=bool(int(args.fsdp_use_orig_params)),
-            device_id=device,
-            sync_module_states=bool(int(args.fsdp_sync_module_states)),
-        )
     sum_loss_times_tokens = torch.zeros((), device=device, dtype=torch.float32)
     sum_tokens = torch.zeros((), device=device, dtype=torch.float32)
 
@@ -197,8 +135,6 @@ def main() -> None:
         print(f"phase: {args.phase}")
         print(f"eval_loss: {eval_loss:.6f}")
         print(f"ppl: {ppl:.6f}")
-    if did_init_pg:
-        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

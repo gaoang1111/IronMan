@@ -16,7 +16,7 @@ OUTPUT_DIR=${OUTPUT_DIR:-}
 # RESET_STEP_ON_RESUME=${RESET_STEP_ON_RESUME:-true}
 
 # to load phase2 checkpoint, you need to set RESUME_PATH, LOAD_OPTIMIZER, RESET_STEP_ON_RESUME
-RESUME_PATH=${RESUME_PATH:-../checkpoints/phase-full-eoc/phase-full_step_60}
+RESUME_PATH=${RESUME_PATH:-../default-vepfs/public/user/ga/Iron/checkpoints/phase-full-dynamicq/phase-full_step_480}
 LOAD_OPTIMIZER=${LOAD_OPTIMIZER:-true}
 RESET_STEP_ON_RESUME=${RESET_STEP_ON_RESUME:-false}
 

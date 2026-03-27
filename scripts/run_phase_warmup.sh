@@ -5,10 +5,10 @@ cd "$(dirname "$0")/.."
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 
-MODEL_NAME=${MODEL_NAME:-YOUR_MODEL_PATH} #only required in phase warmup
+MODEL_NAME=${MODEL_NAME:-/default-vepfs/public/user/ga/Iron/models/Llama-3.1-8B}
 PHASE=${PHASE:-phase1}
-DATA_PATH=${DATA_PATH:-YOUR_DATA_PATH}
-OUTPUT_DIR=${OUTPUT_DIR:-YOUR_OUTPUT_PATH}
+DATA_PATH=${DATA_PATH:-/default-vepfs/public/user/ga/Iron/33/data/train.jsonl}
+OUTPUT_DIR=${OUTPUT_DIR:-../checkpoints/phase-warmup-denamicq}
 
 RESUME_PATH=${RESUME_PATH:-}
 
@@ -26,7 +26,7 @@ TRAIN_ONLY_SPECIAL=${TRAIN_ONLY_SPECIAL:-true}
 WARMUP_STEPS=${WARMUP_STEPS:-10}
 GRAD_PROBE=${GRAD_PROBE:-true}
 
-EVAL_DATA_PATH=${EVAL_DATA_PATH:-YOUR_EVAL_DATA_PATH}
+EVAL_DATA_PATH=${EVAL_DATA_PATH:-/default-vepfs/public/user/ga/Iron/33/data/eval.jsonl}
 EVAL_STEPS=${EVAL_STEPS:-30}
 EVAL_MAX_BATCHES=${EVAL_MAX_BATCHES:-0}
 
@@ -42,8 +42,8 @@ DDP_FIND_UNUSED=${DDP_FIND_UNUSED:-true}
 NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 
 WANDB_PROJECT=${WANDB_PROJECT:-Mark-42}
-WANDB_RUN_NAME=${WANDB_RUN_NAME:-Mark-42-phase-warmup-deepkv-group-gate}
-WANDB_RUN_TAGS=${WANDB_RUN_TAGS:-phase-warmup,deepkv,javis,attn,group,gate}
+WANDB_RUN_NAME=${WANDB_RUN_NAME:-Mark-42-phase-warmup-denamicq}
+WANDB_RUN_TAGS=${WANDB_RUN_TAGS:-phase-warmup,denamicq}
 
 JAVIS_WARMUP_SAMPLES=${JAVIS_WARMUP_SAMPLES:-20}
 JAVIS_WARMUP_SAVE_PATH=${JAVIS_WARMUP_SAVE_PATH:-../javis}

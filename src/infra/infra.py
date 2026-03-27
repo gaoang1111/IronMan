@@ -48,7 +48,7 @@ def _mark42_llama_attention_forward(
     cache_position: torch.LongTensor | None = None,
     **kwargs,
 ):
-    javis_all_layer_kvs = kwargs.pop("javis_all_layer_kvs", None)
+    javis_kv = kwargs.pop("javis_kv", None)
     javis_meta = kwargs.pop("javis_meta", None)
 
     input_shape = hidden_states.shape[:-1]
@@ -56,48 +56,48 @@ def _mark42_llama_attention_forward(
     head_dim = int(self.head_dim)
     hidden_shape = (*input_shape, -1, head_dim)
 
+    # 🚀 2. 原生投影
     query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-    if getattr(self, "layer_idx", -1) == 0:
-        if past_key_values is not None:
-            current_cache_len = past_key_values.get_seq_length()
-            print(f"🔍 [Engine Monitor] Input Query Length: {q_len} | Current KV Cache Length: {current_cache_len}")
-    if javis_all_layer_kvs is not None and javis_meta is not None:
-        target_layers = getattr(self, "_mark42_target_layers", None)
-        if target_layers is None or int(getattr(self, "layer_idx", -1)) in target_layers:
-            mem_pos_abs, num_q = javis_meta
-            layer_idx = int(getattr(self, "layer_idx", -1))
-            layer_kv = None
-            if isinstance(javis_all_layer_kvs, (list, tuple)) and 0 <= layer_idx < len(javis_all_layer_kvs):
-                layer_kv = javis_all_layer_kvs[layer_idx]
-            if layer_kv is not None:
-                k_javis, v_javis = layer_kv
-                if isinstance(mem_pos_abs, torch.Tensor) and mem_pos_abs.dim() == 1:
-                    mem_pos_abs = mem_pos_abs.unsqueeze(0)
-                if isinstance(k_javis, torch.Tensor) and k_javis.dim() == 4:
-                    k_javis = k_javis.unsqueeze(1)
-                    v_javis = v_javis.unsqueeze(1)
+    # 🚀 3. 直接注入 (只要 javis_kv 存在，说明这一层被选中了)
+    if 0:
+    # if javis_kv is not None and javis_meta is not None:
+        layer_idx = int(getattr(self, "layer_idx", -1))
+        # if layer_idx == 15:
+        #     print(f"=================== use deep kv at Layer {layer_idx}")
+        
+        mem_pos_abs, num_q = javis_meta
+        k_javis, v_javis = javis_kv
+        
+        # 维度对齐处理
+        if isinstance(mem_pos_abs, torch.Tensor) and mem_pos_abs.dim() == 1:
+            mem_pos_abs = mem_pos_abs.unsqueeze(0)
+        if isinstance(k_javis, torch.Tensor) and k_javis.dim() == 4:
+            k_javis = k_javis.unsqueeze(1)
+            v_javis = v_javis.unsqueeze(1)
 
-                past_len = int(past_key_values.get_seq_length()) if past_key_values is not None else 0
-                mem_pos_abs = mem_pos_abs.to(device=hidden_states.device)
-                local_pos = mem_pos_abs - past_len
+        past_len = int(past_key_values.get_seq_length()) if past_key_values is not None else 0
+        mem_pos_abs = mem_pos_abs.to(device=hidden_states.device)
+        local_pos = mem_pos_abs - past_len
 
-                key_states = key_states.clone()
-                value_states = value_states.clone()
-                for b in range(bsz):
-                    for c in range(int(local_pos.size(1))):
-                        start = int(local_pos[b, c].item())
-                        if 0 <= start and start + int(num_q) <= q_len:
-                            key_states[b, :, start : start + int(num_q), :] = (
-                                key_states[b, :, start : start + int(num_q), :]
-                                + k_javis[b, c].to(dtype=key_states.dtype, device=key_states.device)
-                            )
-                            value_states[b, :, start : start + int(num_q), :] = (
-                                value_states[b, :, start : start + int(num_q), :]
-                                + v_javis[b, c].to(dtype=value_states.dtype, device=value_states.device)
-                            )
+        # Clone 防止 In-place 报错
+        key_states = key_states.clone()
+        value_states = value_states.clone()
+        
+        for b in range(bsz):
+            for c in range(int(local_pos.size(1))):
+                start = int(local_pos[b, c].item())
+                if 0 <= start and start + int(num_q) <= q_len:
+                    key_states[b, :, start : start + int(num_q), :] = (
+                        key_states[b, :, start : start + int(num_q), :]
+                        + k_javis[b, c].to(dtype=key_states.dtype, device=key_states.device)
+                    )
+                    value_states[b, :, start : start + int(num_q), :] = (
+                        value_states[b, :, start : start + int(num_q), :]
+                        + v_javis[b, c].to(dtype=value_states.dtype, device=value_states.device)
+                    )
 
     from transformers.models.llama.modeling_llama import ALL_ATTENTION_FUNCTIONS, apply_rotary_pos_emb, eager_attention_forward
 
@@ -177,7 +177,8 @@ class Mark42StreamingEngine:
 
     def stream_generate(
         self,
-        prompt_text: str,
+        input_ids: list[int] | None = None,
+        prompt_text: str | None = None,
         *,
         max_new_tokens: int = 512,
         temperature: float = 0.0,
@@ -199,7 +200,11 @@ class Mark42StreamingEngine:
         if self.q_num <= 0:
             raise ValueError(f"q_num must be > 0, got {self.q_num}")
 
-        prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
+        if input_ids is None:
+            prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
+        else:
+            prompt_ids = input_ids
+        # print(f"======== prompt_ids: {prompt_ids}")
         raw_queue: list[int] = [int(x) for x in prompt_ids]
         full_context: list[int] = [int(x) for x in prompt_ids]
 
@@ -335,7 +340,8 @@ class Mark42StreamingEngine:
 
     def generate(
         self,
-        prompt_text: str,
+        input_ids: list[int] | None = None,
+        prompt_text: str | None = None,
         *,
         max_new_tokens: int = 512,
         temperature: float = 0.0,
@@ -344,7 +350,8 @@ class Mark42StreamingEngine:
     ) -> str:
         token_ids: list[int] = []
         for tid in self.stream_generate(
-            prompt_text,
+            input_ids=input_ids,
+            prompt_text=prompt_text,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             repetition_penalty=repetition_penalty,

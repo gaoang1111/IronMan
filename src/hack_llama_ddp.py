@@ -264,7 +264,7 @@ class TrainStepModuleForFullLayersKVInjection(nn.Module):
         )
         # ortho_penalty = torch.relu(current_out_cos.to(gen_loss.dtype) - 0.1)
         
-        q_params = self.iron.javis.q  # shape: [G, Q, H], 例如 [8, 2, 4096]
+        q_params = self.iron.javis.q_base  # shape: [G, Q, H], 例如 [8, 2, 4096]
         if q_params.size(1) >= 2:
             # 计算每组内 Q0 和 Q1 的余弦相似度
             q_cos = F.cosine_similarity(q_params[:, 0, :], q_params[:, 1, :], dim=-1)

@@ -5,18 +5,18 @@ cd "$(dirname "$0")/.."
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 
-MODEL_NAME=${MODEL_NAME:-YOUR_MODEL_PATH} #only required in phase warmup
+MODEL_NAME=${MODEL_NAME:-/default-vepfs/public/user/ga/Iron/models/Llama-3.1-8B}
 PHASE=${PHASE:-phase-full}
-DATA_PATH=${DATA_PATH:-YOUR_DATA_PATH}
-OUTPUT_DIR=${OUTPUT_DIR:-YOUR_OUTPUT_PATH}
+DATA_PATH=${DATA_PATH:-/default-vepfs/public/user/ga/Iron/33/data/train.jsonl}
+OUTPUT_DIR=${OUTPUT_DIR:-../checkpoints/phase-full-dynamicq}
 
 # to load phase cmp checkpoint, you need to set RESUME_PATH, LOAD_OPTIMIZER-false, RESET_STEP_ON_RESUME-true
-# RESUME_PATH=${RESUME_PATH:-YOUR_RESUME_PATH}
+# RESUME_PATH=${RESUME_PATH:-../checkpoints/phase-cmp-denamicq/phase-cmp_step_90}
 # LOAD_OPTIMIZER=${LOAD_OPTIMIZER:-false}
 # RESET_STEP_ON_RESUME=${RESET_STEP_ON_RESUME:-true}
 
 # to load phase-full checkpoint, you need to set RESUME_PATH, LOAD_OPTIMIZER-true, RESET_STEP_ON_RESUME-false
-RESUME_PATH=${RESUME_PATH:-YOUR_RESUME_PATH}
+RESUME_PATH=${RESUME_PATH:-../checkpoints/phase-full-dynamicq/phase-full_step_480}
 LOAD_OPTIMIZER=${LOAD_OPTIMIZER:-true}
 RESET_STEP_ON_RESUME=${RESET_STEP_ON_RESUME:-false}
 
@@ -40,8 +40,8 @@ GRAD_PROBE=${GRAD_PROBE:-true}
 GLOBAL_EPOCH=${GLOBAL_EPOCH:-3} 
 export NCCL_ASYNC_ERROR_HANDLING=1
 
-EVAL_DATA_PATH=${EVAL_DATA_PATH:-YOUR_EVAL_DATA_PATH}
-EVAL_STEPS=${EVAL_STEPS:-20}
+EVAL_DATA_PATH=${EVAL_DATA_PATH:-/default-vepfs/public/user/ga/Iron/33/data/eval.jsonl}
+EVAL_STEPS=${EVAL_STEPS:-1}
 EVAL_MAX_BATCHES=${EVAL_MAX_BATCHES:-13}
 
 LR=${LR:-5e-5}
@@ -58,9 +58,9 @@ DDP_FIND_UNUSED=${DDP_FIND_UNUSED:-false}
 NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 
 
-WANDB_PROJECT=${WANDB_PROJECT:-Mark-42}
-WANDB_RUN_NAME=${WANDB_RUN_NAME:-Mark-42-phase-full-deepkv-group-gate}
-WANDB_RUN_TAGS=${WANDB_RUN_TAGS:-phase-full,deepkv,javis,attn,group,gate}
+WANDB_PROJECT=${WANDB_PROJECT:-Mark-42-dynamicq}
+WANDB_RUN_NAME=${WANDB_RUN_NAME:-Mark-42-phase-full-dynamicq}
+WANDB_RUN_TAGS=${WANDB_RUN_TAGS:-phase-full,dynamicq}
 
 
 JAVIS_QUERY_NUM=${JAVIS_QUERY_NUM:-2}
