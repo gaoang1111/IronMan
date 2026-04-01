@@ -7,7 +7,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser
 from tqdm import tqdm  # 加入进度条缓解焦虑
 
 # 导入你自己的模块
-from src.modeling_iron_cell import IronCellModel
+from src.models import IronCellModel
 
 @dataclass
 class EvalArgs:
@@ -448,7 +448,7 @@ def main():
         import types
 
         if is_resume:
-            from src.configuration_iron_cell import IronCellConfig
+            from src.models import IronCellConfig
             print(f"Loading config and weights from {args.resume_path}...")
             config = IronCellConfig.from_pretrained(args.resume_path)
             setattr(config, "tokenizer_vocab_size", len(tokenizer))
@@ -458,10 +458,7 @@ def main():
 
         model.eval()
 
-        try:
-            from src.hack_llama_fsdp import smart_hybrid_attention_forward # 根据你的实际模块调整
-        except ImportError:
-            raise ImportError("无法导入 smart_hybrid_attention_forward，请检查路径！")
+        from src.attention import smart_hybrid_attention_forward
 
         print("Patching Llama Attention for Deep KV Injection...")
         for layer in model.generator.model.layers:

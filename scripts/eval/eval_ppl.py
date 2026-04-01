@@ -8,7 +8,7 @@ from pathlib import Path
 
 import torch
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 os.sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data_processor import IronCellCollator
@@ -149,10 +149,7 @@ def main() -> None:
         collate_fn=collator,
     )
 
-    if use_fsdp:
-        from src.hack_llama_fsdp import TrainStepModuleForFullLayersKVInjection as TrainStepModule
-    else:
-        from src.hack_llama_ddp import TrainStepModuleForFullLayersKVInjection as TrainStepModule
+    from src.attention import TrainStepModule
     step_module = TrainStepModule(model, phase=str(args.phase))
     step_module.to(torch.bfloat16)
     if use_fsdp:
@@ -169,27 +166,15 @@ def main() -> None:
             device_id=device,
             sync_module_states=bool(int(args.fsdp_sync_module_states)),
         )
-    sum_loss_times_tokens = torch.zeros((), device=device, dtype=torch.float32)
-    sum_tokens = torch.zeros((), device=device, dtype=torch.float32)
-
-    use_amp = device.type == "cuda"
-    with torch.no_grad():
-        for i, batch in enumerate(loader):
-            if args.max_batches and i >= int(args.max_batches):
-                break
-            n_tokens_cpu = (batch.labels != -100).sum().to(dtype=torch.float32)
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                loss, *_ = step_module(batch)
-            sum_loss_times_tokens += loss.detach().float() * n_tokens_cpu.to(device=device)
-            sum_tokens += n_tokens_cpu.to(device=device)
-
-    if _is_dist():
-        torch.distributed.all_reduce(sum_loss_times_tokens, op=torch.distributed.ReduceOp.SUM)
-        torch.distributed.all_reduce(sum_tokens, op=torch.distributed.ReduceOp.SUM)
-
-    denom = float(sum_tokens.clamp(min=1.0).item())
-    eval_loss = float((sum_loss_times_tokens / denom).item())
-    ppl = math.exp(min(eval_loss, 80.0))
+    from src.evaluation import run_eval_loop
+    eval_loss, ppl, _ = run_eval_loop(
+        step_module,
+        loader,
+        device,
+        max_batches=int(args.max_batches),
+        distributed=_is_dist(),
+        use_amp=(device.type == "cuda"),
+    )
 
     if rank0:
         print(f"ckpt_dir: {args.ckpt_dir}")

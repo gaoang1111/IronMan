@@ -27,7 +27,7 @@ if [[ "$PARALLEL" == "ddp" || "$PARALLEL" == "fsdp" ]]; then
   if [[ -z "${NPROC_PER_NODE:-}" ]]; then
     NPROC_PER_NODE="$(python -c 'import torch; print(torch.cuda.device_count())')"
   fi
-  torchrun --nproc_per_node="$NPROC_PER_NODE" scripts/eval_ppl.py \
+  torchrun --nproc_per_node="$NPROC_PER_NODE" scripts/eval/eval_ppl.py \
     --parallel "$PARALLEL" \
     --ckpt_dir "$CKPT_DIR" \
     --data_path "$DATA_PATH" \
@@ -39,7 +39,7 @@ if [[ "$PARALLEL" == "ddp" || "$PARALLEL" == "fsdp" ]]; then
     --device "$DEVICE"
 else
   export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-  python scripts/eval_ppl.py \
+  python scripts/eval/eval_ppl.py \
   --ckpt_dir "$CKPT_DIR" \
   --data_path "$DATA_PATH" \
   --batch_size "$BATCH_SIZE" \

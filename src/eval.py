@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader
 from transformers import HfArgumentParser
 
 from src.data_processor import IronCellCollator
-from src.modeling_iron_cell import IronCellModel
+from src.models import IronCellModel
 from src.train_utils import (
     JsonlDataset,
     _build_fsdp_auto_wrap_policy,
@@ -42,7 +42,7 @@ from transformers.models.llama.modeling_llama import LlamaAttention, LlamaDecode
 import math
 
 from src.train import TrainArgs
-from src.hack_llama_fsdp import TrainStepModuleForFullLayersKVInjection as TrainStepModule
+from src.attention import TrainStepModule
 
 def set_phase(model: IronCellModel, phase: str) -> None:
     print(f"--> Setting model to {phase} mode...")

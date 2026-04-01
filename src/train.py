@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader
 from transformers import HfArgumentParser
 
 from src.data_processor import IronCellCollator
-from src.modeling_iron_cell import IronCellModel
+from src.models import IronCellModel
 from src.train_utils import (
     JsonlDataset,
     _build_fsdp_auto_wrap_policy,
@@ -323,10 +323,7 @@ def main() -> None:
 
     micro_count = 0
     
-    if use_ddp:
-        from src.hack_llama_ddp import TrainStepModuleForFullLayersKVInjection as TrainStepModule
-    elif use_fsdp:
-        from src.hack_llama_fsdp import TrainStepModuleForFullLayersKVInjection as TrainStepModule
+    from src.attention import TrainStepModule
     step_module = TrainStepModule(
         model,
         phase=args.phase,

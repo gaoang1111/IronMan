@@ -47,6 +47,8 @@ class IronCellConfig(PretrainedConfig):
             projector_init_type: "identity" (default) or "gaussian".
             freeze_compressor: Whether compressor forward runs under no_grad
                 and its parameters are frozen.
+            javis_num_queries: Number of query vectors per chunk (compression ratio = chunk_size / num_queries).
+            javis_query_group_size: Number of layers sharing the same query group.
             trainable_components: Default ["javis", "embed_tokens", "special_tokens"].
         """
         self.compressor_model_name = compressor_model_name

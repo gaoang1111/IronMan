@@ -8,7 +8,7 @@ from pathlib import Path
 
 # 导入你自己的模块
 from src.data_processor import IronCellCollator
-from src.modeling_iron_cell import IronCellModel
+from src.models import IronCellModel
 
 
 import math
@@ -270,7 +270,7 @@ def main():
         # 2. 加载模型与配置
         is_resume = bool(args.resume_path and os.path.exists(args.resume_path))
         if is_resume:
-            from src.configuration_iron_cell import IronCellConfig
+            from src.models import IronCellConfig
             print(f"Loading config and weights from {args.resume_path}...")
             config = IronCellConfig.from_pretrained(args.resume_path)
             setattr(config, "tokenizer_vocab_size", len(tokenizer))

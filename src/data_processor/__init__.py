@@ -1,24 +1,19 @@
+"""Data processor for IronCell zipper layout."""
 from __future__ import annotations
 
-from .fixed import (
-    IronCellCollator,
-    ZipperBatch,
-    ZipperBuilder,
-    build_zipper_attn_mask_and_pos_ids,
-    build_zipper_labels,
-    build_zipper_mask_posid,
-)
-from .data_processor_adaptive import AdaptiveIronCellCollator, AdaptiveZipperBuilder, build_zipper_labels_adaptive, build_zipper_mask_posid_adaptive
+from .batch import ZipperBatch
+from .builder import ZipperBuilderBase, ZipperBuilder, AdaptiveZipperBuilder
+from .collator import IronCellCollatorBase, IronCellCollator, AdaptiveIronCellCollator
 
 __all__ = [
+    # Batch
     "ZipperBatch",
+    # Builders
+    "ZipperBuilderBase",
     "ZipperBuilder",
-    "IronCellCollator",
-    "build_zipper_attn_mask_and_pos_ids",
-    "build_zipper_mask_posid",
-    "build_zipper_labels",
     "AdaptiveZipperBuilder",
+    # Collators
+    "IronCellCollatorBase",
+    "IronCellCollator",
     "AdaptiveIronCellCollator",
-    "build_zipper_mask_posid_adaptive",
-    "build_zipper_labels_adaptive",
 ]

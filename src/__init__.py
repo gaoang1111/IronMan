@@ -9,9 +9,8 @@ This directory contains the minimal core modules used by the Iron-Cell MVP:
 - token_utils.py: special token handling + smart initialization
 """
 
-from .configuration_iron_cell import IronCellConfig
+from .models import IronCellConfig, IronCellModel
 from .data_processor import AdaptiveIronCellCollator, AdaptiveZipperBuilder, IronCellCollator, ZipperBatch
-from .modeling_iron_cell import IronCellModel
 from .token_utils import (
     add_iron_cell_special_tokens,
     resize_and_smart_init_special_tokens,

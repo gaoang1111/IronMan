@@ -16,9 +16,8 @@ import matplotlib.pyplot as plt
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 os.sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.configuration_iron_cell import IronCellConfig
+from src.models import IronCellConfig, IronCellModel
 from src.data_processor import IronCellCollator
-from src.modeling_iron_cell import IronCellModel
 from src.token_utils import add_iron_cell_special_tokens
 from src.train_utils import load_model, load_tokenizer
 
